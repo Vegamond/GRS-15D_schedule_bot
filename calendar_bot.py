@@ -1,17 +1,22 @@
 import os
 import re
+import json
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
 TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 GCAL_ICS_URL = os.environ["GCAL_ICS_URL"]
 
-# Україна зараз зазвичай EET/EEST, але в GitHub немає локальної TZ.
-# Робимо простіше: беремо "сьогодні" за Києвом = UTC+2 (зараз зима).
-# Якщо буде літній час — скажеш, підправимо на UTC+3 автоматично.
-KYIV_OFFSET_HOURS = 2
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+STATE_FILE = "state.json"
+
+
+def kyiv_now() -> datetime:
+    return datetime.now(timezone.utc).astimezone(KYIV_TZ)
+
 
 def tg_send(text: str) -> None:
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -23,19 +28,59 @@ def tg_send(text: str) -> None:
     data = urllib.parse.urlencode(payload).encode("utf-8")
     urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=20).read()
 
+
 def fetch_ics() -> str:
     with urllib.request.urlopen(GCAL_ICS_URL, timeout=30) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
-def parse_events_for_today(ics_text: str):
-    # Дуже простий парсер VEVENT з DTSTART/DTEND/SUMMARY/DESCRIPTION/LOCATION/URL
-    # Працює для типового експорту Google Calendar.
-    events = []
 
-    # "сьогодні" за Києвом
-    now_utc = datetime.now(timezone.utc)
-    kyiv_now = now_utc + timedelta(hours=KYIV_OFFSET_HOURS)
-    today = kyiv_now.date()
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def save_state(st: dict) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=2)
+
+
+def parse_dt(s: str):
+    """
+    Підтримка Google iCal:
+    - 20260216T090000Z  -> UTC (Z) -> конвертуємо в Europe/Kyiv
+    - 20260216T090000   -> локальний час календаря -> трактуємо як Europe/Kyiv
+    - 20260216          -> all-day
+    """
+    if not s:
+        return None
+    s = s.strip()
+
+    # all-day date
+    if len(s) == 8 and s.isdigit():
+        d = datetime.strptime(s, "%Y%m%d").date()
+        return datetime(d.year, d.month, d.day, 0, 0, tzinfo=KYIV_TZ)
+
+    is_utc = s.endswith("Z")
+    if is_utc:
+        s = s[:-1]
+
+    try:
+        dt_naive = datetime.strptime(s[:15], "%Y%m%dT%H%M%S")
+    except ValueError:
+        return None
+
+    if is_utc:
+        return dt_naive.replace(tzinfo=timezone.utc).astimezone(KYIV_TZ)
+    else:
+        return dt_naive.replace(tzinfo=KYIV_TZ)
+
+
+def parse_events_for_today(ics_text: str):
+    events = []
+    today = kyiv_now().date()
 
     blocks = ics_text.split("BEGIN:VEVENT")
     for b in blocks[1:]:
@@ -52,25 +97,10 @@ def parse_events_for_today(ics_text: str):
         description = get("DESCRIPTION")
         url = get("URL")
 
-        # Google інколи кладе посилання в DESCRIPTION
         if not url:
             m = re.search(r"https?://\S+", description)
             if m:
                 url = m.group(0)
-
-        # Парсимо формат типу 20260214T090000Z або 20260214T090000
-        def parse_dt(s):
-            if not s:
-                return None
-            s = s.replace("Z", "")
-            try:
-                return datetime.strptime(s[:15], "%Y%m%dT%H%M%S")
-            except ValueError:
-                # fallback: дата без часу
-                try:
-                    return datetime.strptime(s[:8], "%Y%m%d")
-                except ValueError:
-                    return None
 
         ds = parse_dt(dtstart)
         de = parse_dt(dtend)
@@ -78,8 +108,8 @@ def parse_events_for_today(ics_text: str):
         if not ds:
             continue
 
-        # Вважаємо, що час у календарі “локальний”, і показуємо як є
-        if ds.date() != today:
+        # фільтр на "сьогодні" по Києву
+        if ds.astimezone(KYIV_TZ).date() != today:
             continue
 
         events.append({
@@ -93,18 +123,18 @@ def parse_events_for_today(ics_text: str):
     events.sort(key=lambda x: x["start"])
     return events
 
+
 def format_today(events):
-    now_utc = datetime.now(timezone.utc)
-    kyiv_now = now_utc + timedelta(hours=KYIV_OFFSET_HOURS)
-    header = f"📅 Розклад на сьогодні ({kyiv_now.strftime('%d.%m')})\n"
+    now_k = kyiv_now()
+    header = f"📅 Розклад на сьогодні ({now_k.strftime('%d.%m')})\n"
 
     if not events:
         return header + "\nСьогодні в календарі порожньо 🫡"
 
     lines = [header]
     for i, e in enumerate(events, 1):
-        st = e["start"].strftime("%H:%M")
-        en = e["end"].strftime("%H:%M") if e["end"] else ""
+        st = e["start"].astimezone(KYIV_TZ).strftime("%H:%M")
+        en = e["end"].astimezone(KYIV_TZ).strftime("%H:%M") if e["end"] else ""
         time_str = f"{st}–{en}" if en else st
 
         extra = []
@@ -118,11 +148,23 @@ def format_today(events):
 
     return "\n".join(lines)
 
+
 def main():
+    # антиспам: постимо максимум 1 раз на день
+    st = load_state()
+    today_str = kyiv_now().strftime("%Y-%m-%d")
+    if st.get("last_post_date") == today_str:
+        return
+
     ics = fetch_ics()
     events = parse_events_for_today(ics)
     msg = format_today(events)
     tg_send(msg)
+
+    st["last_post_date"] = today_str
+    st["last_post_kyiv_time"] = kyiv_now().strftime("%Y-%m-%d %H:%M")
+    save_state(st)
+
 
 if __name__ == "__main__":
     main()
