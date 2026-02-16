@@ -1,8 +1,10 @@
 name: Daily Schedule Post
 
 on:
+  # Запускаємо часто вранці (UTC), щоб не було пропусків.
+  # Kyiv: UTC+2 / UTC+3, тому беремо "з запасом".
   schedule:
-    - cron: "30 5 * * *"   # 07:30 за Києвом взимку (UTC+2)
+    - cron: "*/15 4-8 * * *"
   workflow_dispatch:
 
 jobs:
@@ -22,3 +24,11 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GCAL_ICS_URL: ${{ secrets.GCAL_ICS_URL }}
         run: python calendar_bot.py
+
+      - name: Commit state
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add state.json || true
+          git commit -m "Update schedule state" || true
+          git push || true
