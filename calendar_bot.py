@@ -3,19 +3,23 @@ import re
 import json
 import urllib.request
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
 TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 GCAL_ICS_URL = os.environ["GCAL_ICS_URL"]
 
+# today | tomorrow
+MODE = os.environ.get("MODE", "today").strip().lower()
+
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = "state.json"
 
-# Пост має вийти зранку після 08:00 (Kyiv)
-POST_HOUR_KYIV = 8
-POST_MINUTE_KYIV = 0
+POST_RULES = {
+    "today": (8, 0),      # після 08:00 Kyiv
+    "tomorrow": (19, 0),  # після 19:00 Kyiv
+}
 
 
 def kyiv_now() -> datetime:
@@ -67,7 +71,7 @@ def save_state(st: dict) -> None:
 
 def parse_dt(s: str):
     """
-    Підтримка форматів Google iCal:
+    Google iCal:
     - 20260216T090000Z  -> UTC (Z) -> конвертуємо в Europe/Kyiv
     - 20260216T090000   -> локальний час -> трактуємо як Europe/Kyiv
     - 20260216          -> all-day
@@ -92,17 +96,16 @@ def parse_dt(s: str):
 
     if is_utc:
         return dt_naive.replace(tzinfo=timezone.utc).astimezone(KYIV_TZ)
-    else:
-        return dt_naive.replace(tzinfo=KYIV_TZ)
+    return dt_naive.replace(tzinfo=KYIV_TZ)
 
 
 # ---------------------------
-# Парсинг "полів" як у твоєму дизайні
+# Парсинг полів (під “структурований дизайн”)
 # ---------------------------
 
 def parse_teacher(text: str) -> str:
     """
-    Шукаємо викладача в описі:
+    Шукаємо викладача в описі, напр:
     "доц. Примиченко В.Г."
     "проф. Іваненко І.І."
     "ст. викл. ..."
@@ -110,8 +113,6 @@ def parse_teacher(text: str) -> str:
     if not text:
         return ""
     t = text.strip()
-
-    # найчастіші шаблони
     m = re.search(r"(?i)\b(доц\.|проф\.|викл\.|асист\.|ст\.?\s*викл\.)\s+[^\n,]+", t)
     return m.group(0).strip() if m else ""
 
@@ -131,8 +132,8 @@ def parse_lesson_type(summary: str, desc: str) -> str:
 
 def parse_subject(summary: str) -> str:
     """
-    Бере предмет з SUMMARY до "—" (довге тире).
-    Напр: "Історія України — Лекція" -> "Історія України"
+    Беремо предмет із SUMMARY до "—"
+    "Історія України — Лекція" -> "Історія України"
     """
     if not summary:
         return "Заняття"
@@ -142,7 +143,7 @@ def parse_subject(summary: str) -> str:
 
 def choose_one_url(description: str) -> str:
     """
-    Вибираємо один лінк з DESCRIPTION:
+    Вибираємо ОДИН лінк з DESCRIPTION:
     - якщо є zoom.us -> беремо ОСТАННІЙ zoom (часто саме він з pwd)
     - інакше -> останній будь-який
     """
@@ -168,7 +169,6 @@ def detect_format(location: str, description: str) -> tuple[str, str]:
         place = "Zoom" if "zoom" in blob else "Online"
         return ("Online", place)
 
-    # аудиторія з LOCATION
     m = re.search(r"(?i)\b(ауд\.?\s*\d+)\b", loc)
     if m:
         return ("Offline", m.group(1).replace("  ", " ").strip())
@@ -179,9 +179,8 @@ def detect_format(location: str, description: str) -> tuple[str, str]:
     return ("", "")
 
 
-def parse_events_for_today(ics_text: str):
+def parse_events_for_date(ics_text: str, target_date):
     events = []
-    today = kyiv_now().date()
 
     blocks = ics_text.split("BEGIN:VEVENT")
     for b in blocks[1:]:
@@ -197,7 +196,7 @@ def parse_events_for_today(ics_text: str):
         location = get("LOCATION") or ""
         description = (get("DESCRIPTION") or "")
 
-        # Google часто зберігає перенос як "\n"
+        # Google часто кодує перенос як "\n"
         description = description.replace("\\n", "\n")
 
         ds = parse_dt(dtstart)
@@ -205,7 +204,8 @@ def parse_events_for_today(ics_text: str):
 
         if not ds:
             continue
-        if ds.astimezone(KYIV_TZ).date() != today:
+
+        if ds.astimezone(KYIV_TZ).date() != target_date:
             continue
 
         subject = parse_subject(summary)
@@ -229,17 +229,22 @@ def parse_events_for_today(ics_text: str):
     return events
 
 
-def format_today(events):
+def format_schedule(events, target_date, mode: str):
     now_k = kyiv_now()
-    date_str = now_k.strftime("%d.%m")
+    date_str = target_date.strftime("%d.%m")
 
     lines = []
-    lines.append("Доброго ранку шановні студенти! ☀️")
-    lines.append(f"📅 Розклад на сьогодні ({date_str})")
+    if mode == "tomorrow":
+        lines.append("Добрий вечір шановні студенти! 🌙")
+        lines.append(f"📅 Розклад на завтра ({date_str})")
+    else:
+        lines.append("Доброго ранку шановні студенти! ☀️")
+        lines.append(f"📅 Розклад на сьогодні ({date_str})")
+
     lines.append("")
 
     if not events:
-        lines.append("🟦 Сьогодні в календарі порожньо 🫡")
+        lines.append("🟦 У календарі порожньо 🫡")
         lines.append(f"⏱ Оновлено: {now_k.strftime('%H:%M')}")
         return "\n".join(lines)
 
@@ -248,7 +253,6 @@ def format_today(events):
         en = e["end"].astimezone(KYIV_TZ).strftime("%H:%M") if e["end"] else ""
         time_str = f"{st}–{en}" if en else st
 
-        # "картка" як у твоєму стилі
         lines.append(f"📌 {i}. {e['subject'].upper()}")
         lines.append(f"🕒 {time_str}")
 
@@ -274,34 +278,40 @@ def format_today(events):
     return "\n".join(lines)
 
 
-def should_post_now() -> bool:
-    """
-    Запускаємо workflow часто, але постимо тільки коли вже 08:00+ за Києвом.
-    Це робить систему стійкою до “плаваючого” GitHub cron.
-    """
+def should_post_now(mode: str) -> bool:
+    h, m = POST_RULES.get(mode, (8, 0))
     now = kyiv_now()
-    return (now.hour > POST_HOUR_KYIV) or (now.hour == POST_HOUR_KYIV and now.minute >= POST_MINUTE_KYIV)
+    return (now.hour > h) or (now.hour == h and now.minute >= m)
 
 
 def main():
     st = load_state()
-    today_str = kyiv_now().strftime("%Y-%m-%d")
+    now = kyiv_now()
 
-    # антиспам: максимум 1 пост на добу
-    if st.get("last_post_date") == today_str:
+    if MODE == "tomorrow":
+        target_date = now.date() + timedelta(days=1)
+        stamp_key = "last_post_tomorrow_date"
+    else:
+        target_date = now.date()
+        stamp_key = "last_post_today_date"
+
+    target_str = target_date.strftime("%Y-%m-%d")
+
+    # антиспам: максимум 1 пост на цільову дату
+    if st.get(stamp_key) == target_str:
         return
 
-    # постимо лише після 08:00 Київ
-    if not should_post_now():
+    # постимо тільки після потрібного часу (08:00 або 19:00)
+    if not should_post_now(MODE):
         return
 
     ics = fetch_ics()
-    events = parse_events_for_today(ics)
-    msg = format_today(events)
+    events = parse_events_for_date(ics, target_date)
+    msg = format_schedule(events, target_date, MODE)
     tg_send(msg)
 
-    st["last_post_date"] = today_str
-    st["last_post_kyiv_time"] = kyiv_now().strftime("%Y-%m-%d %H:%M")
+    st[stamp_key] = target_str
+    st[f"{stamp_key}_kyiv_time"] = kyiv_now().strftime("%Y-%m-%d %H:%M")
     save_state(st)
 
 
