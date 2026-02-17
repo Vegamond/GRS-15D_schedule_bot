@@ -13,7 +13,8 @@ GCAL_ICS_URL = os.environ["GCAL_ICS_URL"]
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = "state.json"
 
-POST_HOUR_KYIV = 8   # 08:00 за Києвом
+# Пост має вийти зранку після 08:00 (Kyiv)
+POST_HOUR_KYIV = 8
 POST_MINUTE_KYIV = 0
 
 
@@ -33,7 +34,10 @@ def tg_send(text: str) -> None:
 
 
 def unfold_ics(text: str) -> str:
-    # RFC5545: "folded lines" -> CRLF + space/tab означає продовження рядка
+    """
+    RFC5545 line folding: довгі рядки розбиваються, а продовження починається з пробілу/таб.
+    Це критично для довгих Zoom-лінків.
+    """
     return (
         text.replace("\r\n ", "")
             .replace("\n ", "")
@@ -63,10 +67,10 @@ def save_state(st: dict) -> None:
 
 def parse_dt(s: str):
     """
-    Підтримка:
-    - 20260216T090000Z  (UTC) -> конвертуємо в Europe/Kyiv
-    - 20260216T090000   (локальний час) -> вважаємо Europe/Kyiv
-    - 20260216          (all-day)
+    Підтримка форматів Google iCal:
+    - 20260216T090000Z  -> UTC (Z) -> конвертуємо в Europe/Kyiv
+    - 20260216T090000   -> локальний час -> трактуємо як Europe/Kyiv
+    - 20260216          -> all-day
     """
     if not s:
         return None
@@ -92,6 +96,89 @@ def parse_dt(s: str):
         return dt_naive.replace(tzinfo=KYIV_TZ)
 
 
+# ---------------------------
+# Парсинг "полів" як у твоєму дизайні
+# ---------------------------
+
+def parse_teacher(text: str) -> str:
+    """
+    Шукаємо викладача в описі:
+    "доц. Примиченко В.Г."
+    "проф. Іваненко І.І."
+    "ст. викл. ..."
+    """
+    if not text:
+        return ""
+    t = text.strip()
+
+    # найчастіші шаблони
+    m = re.search(r"(?i)\b(доц\.|проф\.|викл\.|асист\.|ст\.?\s*викл\.)\s+[^\n,]+", t)
+    return m.group(0).strip() if m else ""
+
+
+def parse_lesson_type(summary: str, desc: str) -> str:
+    blob = f"{summary}\n{desc}".lower()
+    if "лекц" in blob:
+        return "Лекція"
+    if "практ" in blob:
+        return "Практика"
+    if "семін" in blob:
+        return "Семінар"
+    if "лаб" in blob:
+        return "Лабораторна"
+    return ""
+
+
+def parse_subject(summary: str) -> str:
+    """
+    Бере предмет з SUMMARY до "—" (довге тире).
+    Напр: "Історія України — Лекція" -> "Історія України"
+    """
+    if not summary:
+        return "Заняття"
+    parts = [p.strip() for p in summary.split("—")]
+    return parts[0] if parts and parts[0] else summary.strip()
+
+
+def choose_one_url(description: str) -> str:
+    """
+    Вибираємо один лінк з DESCRIPTION:
+    - якщо є zoom.us -> беремо ОСТАННІЙ zoom (часто саме він з pwd)
+    - інакше -> останній будь-який
+    """
+    if not description:
+        return ""
+    urls = re.findall(r"https?://\S+", description)
+    if not urls:
+        return ""
+    zoom_links = [u for u in urls if "zoom.us" in u]
+    return zoom_links[-1] if zoom_links else urls[-1]
+
+
+def detect_format(location: str, description: str) -> tuple[str, str]:
+    """
+    Повертає (format, place)
+    format: Online / Offline / ""
+    place: "Zoom" / "ауд. 207" / інше
+    """
+    loc = (location or "").strip()
+    blob = f"{loc}\n{description}".lower()
+
+    if "zoom" in blob or "online" in blob or "meet.google" in blob:
+        place = "Zoom" if "zoom" in blob else "Online"
+        return ("Online", place)
+
+    # аудиторія з LOCATION
+    m = re.search(r"(?i)\b(ауд\.?\s*\d+)\b", loc)
+    if m:
+        return ("Offline", m.group(1).replace("  ", " ").strip())
+
+    if loc:
+        return ("Offline", loc)
+
+    return ("", "")
+
+
 def parse_events_for_today(ics_text: str):
     events = []
     today = kyiv_now().date()
@@ -106,33 +193,35 @@ def parse_events_for_today(ics_text: str):
 
         dtstart = get("DTSTART")
         dtend = get("DTEND")
-        summary = get("SUMMARY")
-        location = get("LOCATION")
-        description = get("DESCRIPTION")
+        summary = get("SUMMARY") or "Заняття"
+        location = get("LOCATION") or ""
+        description = (get("DESCRIPTION") or "")
 
-        # Google часто кодує перенос як "\n"
-        description = (description or "").replace("\\n", "\n")
-
-        # ❗ URL беремо ТІЛЬКИ з DESCRIPTION (як ти просив)
-        url = ""
-        m = re.search(r"https?://\S+", description)
-        if m:
-            url = m.group(0).strip()
+        # Google часто зберігає перенос як "\n"
+        description = description.replace("\\n", "\n")
 
         ds = parse_dt(dtstart)
         de = parse_dt(dtend)
 
         if not ds:
             continue
-
         if ds.astimezone(KYIV_TZ).date() != today:
             continue
+
+        subject = parse_subject(summary)
+        lesson_type = parse_lesson_type(summary, description)
+        teacher = parse_teacher(description)
+        url = choose_one_url(description)
+        fmt, place = detect_format(location, description)
 
         events.append({
             "start": ds,
             "end": de,
-            "summary": summary or "Заняття",
-            "location": location or "",
+            "subject": subject,
+            "lesson_type": lesson_type,
+            "teacher": teacher,
+            "format": fmt,
+            "place": place,
             "url": url,
         })
 
@@ -147,7 +236,7 @@ def format_today(events):
     lines = []
     lines.append("Доброго ранку шановні студенти! ☀️")
     lines.append(f"📅 Розклад на сьогодні ({date_str})")
-    lines.append("────────────────────")
+    lines.append("")
 
     if not events:
         lines.append("🟦 Сьогодні в календарі порожньо 🫡")
@@ -159,30 +248,39 @@ def format_today(events):
         en = e["end"].astimezone(KYIV_TZ).strftime("%H:%M") if e["end"] else ""
         time_str = f"{st}–{en}" if en else st
 
-        # рядок події
-        lines.append(f"{i}) 🕘 {time_str} — {e['summary']}")
+        # "картка" як у твоєму стилі
+        lines.append(f"📌 {i}. {e['subject'].upper()}")
+        lines.append(f"🕒 {time_str}")
 
-        # підрядки (місце/посилання)
-        if e["location"]:
-            lines.append(f"   📍 {e['location']}")
-        if e["url"]:
-            lines.append(f"   🔗 {e['url']}")
+        if e.get("lesson_type"):
+            lines.append(f"📚 {e['lesson_type']}")
 
-        # невеликий відступ між парами
+        if e.get("teacher"):
+            lines.append(f"👨‍🏫 {e['teacher']}")
+
+        if e.get("format") == "Online":
+            lines.append(f"🌐 Online ({e.get('place') or 'Zoom'})")
+        elif e.get("format") == "Offline":
+            lines.append(f"🏫 {e.get('place') or 'Аудиторія'}")
+
+        if e.get("url"):
+            lines.append(f"🔗 {e['url']}")
+
         if i != len(events):
-            lines.append("")
+            lines.append("──────────────")
 
-    lines.append("────────────────────")
+    lines.append("")
     lines.append(f"⏱ Оновлено: {now_k.strftime('%H:%M')}")
     return "\n".join(lines)
 
 
 def should_post_now() -> bool:
-    """Постимо лише після 08:00 за Києвом (щоб GitHub не “з’їв” точний час)."""
+    """
+    Запускаємо workflow часто, але постимо тільки коли вже 08:00+ за Києвом.
+    Це робить систему стійкою до “плаваючого” GitHub cron.
+    """
     now = kyiv_now()
-    post_time_ok = (now.hour > POST_HOUR_KYIV) or (now.hour == POST_HOUR_KYIV and now.minute >= POST_MINUTE_KYIV)
-    # Можеш обмежити “вікно” наприклад до 12:00, якщо захочеш.
-    return post_time_ok
+    return (now.hour > POST_HOUR_KYIV) or (now.hour == POST_HOUR_KYIV and now.minute >= POST_MINUTE_KYIV)
 
 
 def main():
@@ -193,7 +291,7 @@ def main():
     if st.get("last_post_date") == today_str:
         return
 
-    # чек на 08:00 Київ
+    # постимо лише після 08:00 Київ
     if not should_post_now():
         return
 
