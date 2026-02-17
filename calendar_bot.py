@@ -3,7 +3,7 @@ import re
 import json
 import urllib.request
 import urllib.parse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
@@ -12,6 +12,9 @@ GCAL_ICS_URL = os.environ["GCAL_ICS_URL"]
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = "state.json"
+
+POST_HOUR_KYIV = 8   # 08:00 за Києвом
+POST_MINUTE_KYIV = 0
 
 
 def kyiv_now() -> datetime:
@@ -29,9 +32,20 @@ def tg_send(text: str) -> None:
     urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=20).read()
 
 
+def unfold_ics(text: str) -> str:
+    # RFC5545: "folded lines" -> CRLF + space/tab означає продовження рядка
+    return (
+        text.replace("\r\n ", "")
+            .replace("\n ", "")
+            .replace("\r\n\t", "")
+            .replace("\n\t", "")
+    )
+
+
 def fetch_ics() -> str:
     with urllib.request.urlopen(GCAL_ICS_URL, timeout=30) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+        raw = resp.read().decode("utf-8", errors="replace")
+    return unfold_ics(raw)
 
 
 def load_state() -> dict:
@@ -49,10 +63,10 @@ def save_state(st: dict) -> None:
 
 def parse_dt(s: str):
     """
-    Підтримка Google iCal:
-    - 20260216T090000Z  -> UTC (Z) -> конвертуємо в Europe/Kyiv
-    - 20260216T090000   -> локальний час календаря -> трактуємо як Europe/Kyiv
-    - 20260216          -> all-day
+    Підтримка:
+    - 20260216T090000Z  (UTC) -> конвертуємо в Europe/Kyiv
+    - 20260216T090000   (локальний час) -> вважаємо Europe/Kyiv
+    - 20260216          (all-day)
     """
     if not s:
         return None
@@ -95,12 +109,15 @@ def parse_events_for_today(ics_text: str):
         summary = get("SUMMARY")
         location = get("LOCATION")
         description = get("DESCRIPTION")
-        url = get("URL")
 
-        if not url:
-            m = re.search(r"https?://\S+", description)
-            if m:
-                url = m.group(0)
+        # Google часто кодує перенос як "\n"
+        description = (description or "").replace("\\n", "\n")
+
+        # ❗ URL беремо ТІЛЬКИ з DESCRIPTION (як ти просив)
+        url = ""
+        m = re.search(r"https?://\S+", description)
+        if m:
+            url = m.group(0).strip()
 
         ds = parse_dt(dtstart)
         de = parse_dt(dtend)
@@ -108,7 +125,6 @@ def parse_events_for_today(ics_text: str):
         if not ds:
             continue
 
-        # фільтр на "сьогодні" по Києву
         if ds.astimezone(KYIV_TZ).date() != today:
             continue
 
@@ -116,7 +132,7 @@ def parse_events_for_today(ics_text: str):
             "start": ds,
             "end": de,
             "summary": summary or "Заняття",
-            "location": location,
+            "location": location or "",
             "url": url,
         })
 
@@ -126,34 +142,59 @@ def parse_events_for_today(ics_text: str):
 
 def format_today(events):
     now_k = kyiv_now()
-    header = f"📅 Розклад на сьогодні ({now_k.strftime('%d.%m')})\n"
+    date_str = now_k.strftime("%d.%m")
+
+    lines = []
+    lines.append("Доброго ранку шановні студенти! ☀️")
+    lines.append(f"📅 Розклад на сьогодні ({date_str})")
+    lines.append("────────────────────")
 
     if not events:
-        return header + "\nСьогодні в календарі порожньо 🫡"
+        lines.append("🟦 Сьогодні в календарі порожньо 🫡")
+        lines.append(f"⏱ Оновлено: {now_k.strftime('%H:%M')}")
+        return "\n".join(lines)
 
-    lines = [header]
     for i, e in enumerate(events, 1):
         st = e["start"].astimezone(KYIV_TZ).strftime("%H:%M")
         en = e["end"].astimezone(KYIV_TZ).strftime("%H:%M") if e["end"] else ""
         time_str = f"{st}–{en}" if en else st
 
-        extra = []
+        # рядок події
+        lines.append(f"{i}) 🕘 {time_str} — {e['summary']}")
+
+        # підрядки (місце/посилання)
         if e["location"]:
-            extra.append(e["location"])
+            lines.append(f"   📍 {e['location']}")
         if e["url"]:
-            extra.append(e["url"])
+            lines.append(f"   🔗 {e['url']}")
 
-        tail = ("\n   " + "\n   ".join(extra)) if extra else ""
-        lines.append(f"{i}) {time_str} — {e['summary']}{tail}")
+        # невеликий відступ між парами
+        if i != len(events):
+            lines.append("")
 
+    lines.append("────────────────────")
+    lines.append(f"⏱ Оновлено: {now_k.strftime('%H:%M')}")
     return "\n".join(lines)
 
 
+def should_post_now() -> bool:
+    """Постимо лише після 08:00 за Києвом (щоб GitHub не “з’їв” точний час)."""
+    now = kyiv_now()
+    post_time_ok = (now.hour > POST_HOUR_KYIV) or (now.hour == POST_HOUR_KYIV and now.minute >= POST_MINUTE_KYIV)
+    # Можеш обмежити “вікно” наприклад до 12:00, якщо захочеш.
+    return post_time_ok
+
+
 def main():
-    # антиспам: постимо максимум 1 раз на день
     st = load_state()
     today_str = kyiv_now().strftime("%Y-%m-%d")
+
+    # антиспам: максимум 1 пост на добу
     if st.get("last_post_date") == today_str:
+        return
+
+    # чек на 08:00 Київ
+    if not should_post_now():
         return
 
     ics = fetch_ics()
