@@ -103,18 +103,53 @@ def parse_dt(s: str):
 # Парсинг полів (під “структурований дизайн”)
 # ---------------------------
 
-def parse_teacher(text: str) -> str:
+def parse_teacher_from_text(summary: str, location: str, description: str) -> str:
     """
-    Шукаємо викладача в описі, напр:
-    "доц. Примиченко В.Г."
-    "проф. Іваненко І.І."
-    "ст. викл. ..."
+    Шукаємо викладача в summary/location/description.
+    Підтримує:
+      - "Викладач: доц. Примиченко В.Г."
+      - "доц. Примиченко В.Г."
+      - "Примиченко В.Г." (без титулу)
     """
-    if not text:
+    blob = "\n".join([summary or "", location or "", description or ""]).strip()
+    if not blob:
         return ""
-    t = text.strip()
-    m = re.search(r"(?i)\b(доц\.|проф\.|викл\.|асист\.|ст\.?\s*викл\.)\s+[^\n,]+", t)
-    return m.group(0).strip() if m else ""
+
+    # 1) Явні ключі типу "Викладач: ..."
+    m = re.search(r"(?im)^\s*(викладач|лектор|teacher)\s*[:\-]\s*(.+)$", blob)
+    if m:
+        val = m.group(2).strip()
+        val = val.split("\n")[0].strip()
+        return val
+
+    # 2) Варіант із титулом
+    m = re.search(r"(?i)\b(доц\.|проф\.|викл\.|асист\.|ст\.?\s*викл\.)\s+[^\n,]+", blob)
+    if m:
+        return m.group(0).strip()
+
+    # 3) Просто "Прізвище І.П."
+    m = re.search(r"(?i)\b[А-ЯІЇЄҐ][а-яіїєґ’\-]+\s+[А-ЯІЇЄҐ]\.[А-ЯІЇЄҐ]\.?\b", blob)
+    if m:
+        return m.group(0).strip()
+
+    return ""
+
+
+def parse_teacher_from_attendee(event_block: str) -> str:
+    """
+    Google Calendar може показувати викладача в інтерфейсі як "гостя",
+    а в .ics це буде ATTENDEE;CN=...
+    """
+    # CN може бути в лапках або без
+    matches = re.findall(r"ATTENDEE;[^:\n]*CN=(\"[^\"]+\"|[^;:\n]+)", event_block)
+    if not matches:
+        return ""
+
+    # беремо першого "гостя" як викладача (зазвичай 1)
+    cn = matches[0].strip()
+    if cn.startswith('"') and cn.endswith('"'):
+        cn = cn[1:-1]
+    return cn.strip()
 
 
 def parse_lesson_type(summary: str, desc: str) -> str:
@@ -183,21 +218,18 @@ def parse_events_for_date(ics_text: str, target_date):
     events = []
 
     blocks = ics_text.split("BEGIN:VEVENT")
-    for b in blocks[1:]:
-        b = b.split("END:VEVENT")[0]
+    for raw in blocks[1:]:
+        block = raw.split("END:VEVENT")[0]
 
         def get(field):
-            m = re.search(rf"^{field}[^:]*:(.*)$", b, flags=re.MULTILINE)
+            m = re.search(rf"^{field}[^:]*:(.*)$", block, flags=re.MULTILINE)
             return m.group(1).strip() if m else ""
 
         dtstart = get("DTSTART")
         dtend = get("DTEND")
         summary = get("SUMMARY") or "Заняття"
         location = get("LOCATION") or ""
-        description = (get("DESCRIPTION") or "")
-
-        # Google часто кодує перенос як "\n"
-        description = description.replace("\\n", "\n")
+        description = (get("DESCRIPTION") or "").replace("\\n", "\n")
 
         ds = parse_dt(dtstart)
         de = parse_dt(dtend)
@@ -210,9 +242,14 @@ def parse_events_for_date(ics_text: str, target_date):
 
         subject = parse_subject(summary)
         lesson_type = parse_lesson_type(summary, description)
-        teacher = parse_teacher(description)
         url = choose_one_url(description)
         fmt, place = detect_format(location, description)
+
+        # 1) пробуємо дістати викладача з тексту
+        teacher = parse_teacher_from_text(summary, location, description)
+        # 2) якщо не знайшли — беремо з ATTENDEE
+        if not teacher:
+            teacher = parse_teacher_from_attendee(block)
 
         events.append({
             "start": ds,
