@@ -2,8 +2,7 @@ name: Schedule - Today
 
 on:
   schedule:
-    # Часто вранці (UTC), щоб не проспати. Пост контролює код (після 08:00 Kyiv).
-    - cron: "*/10 4-10 * * *"
+    - cron: "0 6 * * *"   # 08:00 Kyiv (за умови UTC+2)
   workflow_dispatch:
 
 permissions:
