@@ -38,10 +38,6 @@ def tg_send(text: str) -> None:
 
 
 def unfold_ics(text: str) -> str:
-    """
-    RFC5545 line folding: довгі рядки розбиваються, а продовження починається з пробілу/таб.
-    Це критично для довгих Zoom-лінків.
-    """
     return (
         text.replace("\r\n ", "")
             .replace("\n ", "")
@@ -70,17 +66,10 @@ def save_state(st: dict) -> None:
 
 
 def parse_dt(s: str):
-    """
-    Google iCal:
-    - 20260216T090000Z  -> UTC (Z) -> конвертуємо в Europe/Kyiv
-    - 20260216T090000   -> локальний час -> трактуємо як Europe/Kyiv
-    - 20260216          -> all-day
-    """
     if not s:
         return None
     s = s.strip()
 
-    # all-day date
     if len(s) == 8 and s.isdigit():
         d = datetime.strptime(s, "%Y%m%d").date()
         return datetime(d.year, d.month, d.day, 0, 0, tzinfo=KYIV_TZ)
@@ -100,34 +89,180 @@ def parse_dt(s: str):
 
 
 # ---------------------------
-# Парсинг полів (під “структурований дизайн”)
+# Погода (Dnipro) — Open-Meteo (без ключа)
+# ---------------------------
+
+WEATHER_CODE_UA = {
+    0: "ясно",
+    1: "переважно ясно",
+    2: "мінлива хмарність",
+    3: "хмарно",
+    45: "туман",
+    48: "паморозь / туман",
+    51: "мряка (слабка)",
+    53: "мряка (помірна)",
+    55: "мряка (сильна)",
+    56: "крижана мряка (слабка)",
+    57: "крижана мряка (сильна)",
+    61: "дощ (слабкий)",
+    63: "дощ (помірний)",
+    65: "дощ (сильний)",
+    66: "крижаний дощ (слабкий)",
+    67: "крижаний дощ (сильний)",
+    71: "сніг (слабкий)",
+    73: "сніг (помірний)",
+    75: "сніг (сильний)",
+    77: "снігова крупа",
+    80: "зливи (слабкі)",
+    81: "зливи (помірні)",
+    82: "зливи (сильні)",
+    85: "снігопад (слабкий)",
+    86: "снігопад (сильний)",
+    95: "гроза",
+    96: "гроза з градом (слабка)",
+    99: "гроза з градом (сильна)",
+}
+
+
+def _fmt_int(x):
+    if x is None:
+        return None
+    try:
+        return int(round(float(x)))
+    except Exception:
+        return None
+
+
+def emoji_for_weathercode(code: int | None) -> str:
+    if code is None:
+        return "🌤️"
+
+    if code == 0:
+        return "☀️"
+    if code in (1, 2):
+        return "🌤️"
+    if code == 3:
+        return "☁️"
+    if code in (45, 48):
+        return "🌫️"
+
+    if code in (51, 53, 55, 56, 57):
+        return "🌦️"
+    if code in (61, 63, 65, 80, 81, 82, 66, 67):
+        return "🌧️"
+
+    if code in (71, 73, 75, 77, 85, 86):
+        return "❄️"
+
+    if code in (95, 96, 99):
+        return "⛈️"
+
+    return "🌤️"
+
+
+def fetch_dnipro_weather(day_offset: int) -> dict:
+    """
+    day_offset:
+      0 = сьогодні
+      1 = завтра
+    """
+    lat, lon = 48.45, 34.98
+    url = (
+        "https://api.open-meteo.com/v1/forecast?"
+        f"latitude={lat}&longitude={lon}"
+        "&current=temperature_2m,apparent_temperature,weathercode,wind_speed_10m"
+        "&daily=weathercode,temperature_2m_min,temperature_2m_max,precipitation_probability_max"
+        "&timezone=Europe%2FKyiv"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return {}
+
+    try:
+        cur = data.get("current", {})
+        daily = data.get("daily", {})
+
+        codes = daily.get("weathercode") or []
+        tmin = daily.get("temperature_2m_min") or []
+        tmax = daily.get("temperature_2m_max") or []
+        pmax = daily.get("precipitation_probability_max") or []
+
+        code_daily = codes[day_offset] if len(codes) > day_offset else None
+        desc = WEATHER_CODE_UA.get(code_daily, "погода")
+
+        out = {
+            "code": code_daily,
+            "desc": desc,
+            "tmin": _fmt_int(tmin[day_offset]) if len(tmin) > day_offset else None,
+            "tmax": _fmt_int(tmax[day_offset]) if len(tmax) > day_offset else None,
+            "precip_prob": _fmt_int(pmax[day_offset]) if len(pmax) > day_offset else None,
+        }
+
+        if day_offset == 0:
+            out["temp"] = _fmt_int(cur.get("temperature_2m"))
+            out["feels"] = _fmt_int(cur.get("apparent_temperature"))
+            out["wind"] = _fmt_int(cur.get("wind_speed_10m"))
+
+        return out
+    except Exception:
+        return {}
+
+
+def format_weather_block_dnipro(day_offset: int) -> list[str]:
+    w = fetch_dnipro_weather(day_offset)
+    if not w:
+        return []
+
+    when = "на сьогодні" if day_offset == 0 else "на завтра"
+    lines = [f"🌤 Погода в Дніпрі {when}:"]
+
+    if day_offset == 0 and w.get("temp") is not None:
+        lines.append(f"{w['temp']}°C, {w.get('desc', 'погода')}")
+        if w.get("feels") is not None:
+            lines.append(f"🌡 Відчувається як: {w['feels']}°C")
+        if w.get("wind") is not None:
+            lines.append(f"💨 Вітер: {w['wind']} м/с")
+    else:
+        lines.append(w.get("desc", "погода"))
+
+    if w.get("tmin") is not None and w.get("tmax") is not None:
+        lines.append(f"📈 Мін/Макс: {w['tmin']}°C / {w['tmax']}°C")
+
+    if w.get("precip_prob") is not None:
+        lines.append(f"☔ Ймовірність опадів: {w['precip_prob']}%")
+
+    lines.append("")
+    return lines
+
+
+def weather_emoji_dnipro(day_offset: int) -> str:
+    w = fetch_dnipro_weather(day_offset)
+    if not w:
+        return "🌤️"
+    return emoji_for_weathercode(w.get("code"))
+
+
+# ---------------------------
+# Парсинг полів (розклад)
 # ---------------------------
 
 def parse_teacher_from_text(summary: str, location: str, description: str) -> str:
-    """
-    Шукаємо викладача в summary/location/description.
-    Підтримує:
-      - "Викладач: доц. Примиченко В.Г."
-      - "доц. Примиченко В.Г."
-      - "Примиченко В.Г." (без титулу)
-    """
     blob = "\n".join([summary or "", location or "", description or ""]).strip()
     if not blob:
         return ""
 
-    # 1) Явні ключі типу "Викладач: ..."
     m = re.search(r"(?im)^\s*(викладач|лектор|teacher)\s*[:\-]\s*(.+)$", blob)
     if m:
         val = m.group(2).strip()
         val = val.split("\n")[0].strip()
         return val
 
-    # 2) Варіант із титулом
     m = re.search(r"(?i)\b(доц\.|проф\.|викл\.|асист\.|ст\.?\s*викл\.)\s+[^\n,]+", blob)
     if m:
         return m.group(0).strip()
 
-    # 3) Просто "Прізвище І.П."
     m = re.search(r"(?i)\b[А-ЯІЇЄҐ][а-яіїєґ’\-]+\s+[А-ЯІЇЄҐ]\.[А-ЯІЇЄҐ]\.?\b", blob)
     if m:
         return m.group(0).strip()
@@ -136,16 +271,9 @@ def parse_teacher_from_text(summary: str, location: str, description: str) -> st
 
 
 def parse_teacher_from_attendee(event_block: str) -> str:
-    """
-    Google Calendar може показувати викладача в інтерфейсі як "гостя",
-    а в .ics це буде ATTENDEE;CN=...
-    """
-    # CN може бути в лапках або без
     matches = re.findall(r"ATTENDEE;[^:\n]*CN=(\"[^\"]+\"|[^;:\n]+)", event_block)
     if not matches:
         return ""
-
-    # беремо першого "гостя" як викладача (зазвичай 1)
     cn = matches[0].strip()
     if cn.startswith('"') and cn.endswith('"'):
         cn = cn[1:-1]
@@ -166,10 +294,6 @@ def parse_lesson_type(summary: str, desc: str) -> str:
 
 
 def parse_subject(summary: str) -> str:
-    """
-    Беремо предмет із SUMMARY до "—"
-    "Історія України — Лекція" -> "Історія України"
-    """
     if not summary:
         return "Заняття"
     parts = [p.strip() for p in summary.split("—")]
@@ -177,11 +301,6 @@ def parse_subject(summary: str) -> str:
 
 
 def choose_one_url(description: str) -> str:
-    """
-    Вибираємо ОДИН лінк з DESCRIPTION:
-    - якщо є zoom.us -> беремо ОСТАННІЙ zoom (часто саме він з pwd)
-    - інакше -> останній будь-який
-    """
     if not description:
         return ""
     urls = re.findall(r"https?://\S+", description)
@@ -192,11 +311,6 @@ def choose_one_url(description: str) -> str:
 
 
 def detect_format(location: str, description: str) -> tuple[str, str]:
-    """
-    Повертає (format, place)
-    format: Online / Offline / ""
-    place: "Zoom" / "ауд. 207" / інше
-    """
     loc = (location or "").strip()
     blob = f"{loc}\n{description}".lower()
 
@@ -216,8 +330,8 @@ def detect_format(location: str, description: str) -> tuple[str, str]:
 
 def parse_events_for_date(ics_text: str, target_date):
     events = []
-
     blocks = ics_text.split("BEGIN:VEVENT")
+
     for raw in blocks[1:]:
         block = raw.split("END:VEVENT")[0]
 
@@ -233,7 +347,6 @@ def parse_events_for_date(ics_text: str, target_date):
 
         ds = parse_dt(dtstart)
         de = parse_dt(dtend)
-
         if not ds:
             continue
 
@@ -245,9 +358,7 @@ def parse_events_for_date(ics_text: str, target_date):
         url = choose_one_url(description)
         fmt, place = detect_format(location, description)
 
-        # 1) пробуємо дістати викладача з тексту
         teacher = parse_teacher_from_text(summary, location, description)
-        # 2) якщо не знайшли — беремо з ATTENDEE
         if not teacher:
             teacher = parse_teacher_from_attendee(block)
 
@@ -273,12 +384,18 @@ def format_schedule(events, target_date, mode: str):
     lines = []
     if mode == "tomorrow":
         lines.append("Добрий вечір шановні студенти! 🌙")
-        lines.append(f"📅 Розклад на завтра ({date_str})")
+        lines.append("")
+        lines.extend(format_weather_block_dnipro(1))
+        wx = weather_emoji_dnipro(1)
+        lines.append(f"📅 {wx} Розклад на завтра ({date_str})")
+        lines.append("")
     else:
         lines.append("Доброго ранку шановні студенти! ☀️")
-        lines.append(f"📅 Розклад на сьогодні ({date_str})")
-
-    lines.append("")
+        lines.append("")
+        lines.extend(format_weather_block_dnipro(0))
+        wx = weather_emoji_dnipro(0)
+        lines.append(f"📅 {wx} Розклад на сьогодні ({date_str})")
+        lines.append("")
 
     if not events:
         lines.append("🟦 У календарі порожньо 🫡")
@@ -334,11 +451,9 @@ def main():
 
     target_str = target_date.strftime("%Y-%m-%d")
 
-    # антиспам: максимум 1 пост на цільову дату
     if st.get(stamp_key) == target_str:
         return
 
-    # постимо тільки після потрібного часу (08:00 або 19:00)
     if not should_post_now(MODE):
         return
 
