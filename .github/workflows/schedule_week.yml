@@ -30,7 +30,7 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GCAL_ICS_URL: ${{ secrets.GCAL_ICS_URL }}
           TG_SCHEDULE_THREAD_ID: ${{ secrets.TG_SCHEDULE_THREAD_ID }} # <-- 2
-        run: run: python calendar_bot.py week --force
+        run: python calendar_bot.py week --force
 
       - name: Commit state
         run: |
