@@ -2,8 +2,7 @@ name: Schedule - Week
 
 on:
   schedule:
-    - cron: "0 18 * * 0"  # backup for DST
-    - cron: "0 19 * * 0"  # backup for DST
+    - cron: "0 16 * * 0" # Sunday 18:00 Kyiv (winter UTC+2)
   workflow_dispatch:
 
 jobs:
@@ -19,16 +18,17 @@ jobs:
 
       - name: Post schedule (week) to Schedule thread
         env:
+          MODE: week
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TG_SCHEDULE_THREAD_ID: ${{ secrets.TG_SCHEDULE_THREAD_ID }}
           GCAL_ICS_URL: ${{ secrets.GCAL_ICS_URL }}
-        run: python calendar_bot.py week
+        run: python calendar_bot.py
 
       - name: Commit state
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git add state.json || true
-          git commit -m "Update state (week)" || true
-          git push || true
+          git add state.json
+          git commit -m "Update state (week)" || echo "No changes"
+          git push
