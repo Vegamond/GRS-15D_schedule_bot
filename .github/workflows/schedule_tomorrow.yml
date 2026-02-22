@@ -2,7 +2,7 @@ name: Schedule - Tomorrow
 
 on:
   schedule:
-    - cron: "0 17 * * *"  # 19:00 Kyiv (за умови UTC+2)
+    - cron: "*/10 15-18 * * *"  # UTC window that covers 19:00 Kyiv in both seasons
   workflow_dispatch:
 
 permissions:
@@ -17,9 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
