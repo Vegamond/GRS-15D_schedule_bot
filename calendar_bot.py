@@ -3,15 +3,18 @@ import re
 import json
 import urllib.request
 import urllib.parse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time, date
 from zoneinfo import ZoneInfo
 
 TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
 TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 GCAL_ICS_URL = os.environ["GCAL_ICS_URL"]
 
-# today | tomorrow
+# today | tomorrow | week
 MODE = os.environ.get("MODE", "today").strip().lower()
+
+# optional: topic/thread id for "Розклад"
+TG_SCHEDULE_THREAD_ID = os.environ.get("TG_SCHEDULE_THREAD_ID")  # e.g. "1234"
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = "state.json"
@@ -26,18 +29,25 @@ def kyiv_now() -> datetime:
     return datetime.now(timezone.utc).astimezone(KYIV_TZ)
 
 
-def tg_send(text: str) -> None:
+def tg_send(text: str, thread_id: str | None = None) -> None:
+    """
+    If thread_id is provided, message goes to that forum topic.
+    """
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TG_CHAT_ID,
         "text": text,
         "disable_web_page_preview": True,
     }
+    if thread_id:
+        payload["message_thread_id"] = int(thread_id)
+
     data = urllib.parse.urlencode(payload).encode("utf-8")
     urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=20).read()
 
 
 def unfold_ics(text: str) -> str:
+    # RFC5545 line folding fix
     return (
         text.replace("\r\n ", "")
             .replace("\n ", "")
@@ -66,6 +76,12 @@ def save_state(st: dict) -> None:
 
 
 def parse_dt(s: str):
+    """
+    Google iCal:
+    - 20260216T090000Z  -> UTC (Z)
+    - 20260216T090000   -> local (assume Kyiv)
+    - 20260216          -> all-day
+    """
     if not s:
         return None
     s = s.strip()
@@ -89,7 +105,7 @@ def parse_dt(s: str):
 
 
 # ---------------------------
-# Погода (Dnipro) — Open-Meteo (без ключа)
+# Weather (Dnipro) — Open-Meteo (no key)
 # ---------------------------
 
 WEATHER_CODE_UA = {
@@ -136,7 +152,6 @@ def _fmt_int(x):
 def emoji_for_weathercode(code: int | None) -> str:
     if code is None:
         return "🌤️"
-
     if code == 0:
         return "☀️"
     if code in (1, 2):
@@ -145,26 +160,22 @@ def emoji_for_weathercode(code: int | None) -> str:
         return "☁️"
     if code in (45, 48):
         return "🌫️"
-
     if code in (51, 53, 55, 56, 57):
         return "🌦️"
     if code in (61, 63, 65, 80, 81, 82, 66, 67):
         return "🌧️"
-
     if code in (71, 73, 75, 77, 85, 86):
         return "❄️"
-
     if code in (95, 96, 99):
         return "⛈️"
-
     return "🌤️"
 
 
 def fetch_dnipro_weather(day_offset: int) -> dict:
     """
     day_offset:
-      0 = сьогодні
-      1 = завтра
+      0 = today
+      1 = tomorrow
     """
     lat, lon = 48.45, 34.98
     url = (
@@ -174,8 +185,13 @@ def fetch_dnipro_weather(day_offset: int) -> dict:
         "&daily=weathercode,temperature_2m_min,temperature_2m_max,precipitation_probability_max"
         "&timezone=Europe%2FKyiv"
     )
+
     try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (ScheduleBot; GitHub Actions)"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception:
         return {}
@@ -245,7 +261,7 @@ def weather_emoji_dnipro(day_offset: int) -> str:
 
 
 # ---------------------------
-# Парсинг полів (розклад)
+# Schedule parsing from ICS
 # ---------------------------
 
 def parse_teacher_from_text(summary: str, location: str, description: str) -> str:
@@ -328,7 +344,7 @@ def detect_format(location: str, description: str) -> tuple[str, str]:
     return ("", "")
 
 
-def parse_events_for_date(ics_text: str, target_date):
+def parse_events_for_date(ics_text: str, target_date: date):
     events = []
     blocks = ics_text.split("BEGIN:VEVENT")
 
@@ -377,7 +393,11 @@ def parse_events_for_date(ics_text: str, target_date):
     return events
 
 
-def format_schedule(events, target_date, mode: str):
+# ---------------------------
+# Formatting
+# ---------------------------
+
+def format_day_schedule(events, target_date: date, mode: str) -> str:
     now_k = kyiv_now()
     date_str = target_date.strftime("%d.%m")
 
@@ -432,6 +452,68 @@ def format_schedule(events, target_date, mode: str):
     return "\n".join(lines)
 
 
+def next_week_monday_from_sunday(now_k: datetime) -> date:
+    """
+    If run on Sunday, returns next Monday.
+    If run other day, still returns next Monday (upcoming).
+    """
+    # weekday: Mon=0 ... Sun=6
+    days_until_monday = (7 - now_k.weekday()) % 7
+    if days_until_monday == 0:
+        days_until_monday = 7
+    return now_k.date() + timedelta(days=days_until_monday)
+
+
+def format_week_schedule(ics: str, monday: date) -> str:
+    start = monday
+    end = monday + timedelta(days=6)
+
+    lines = []
+    lines.append("📚 Розклад на тиждень")
+    lines.append(f"🗓 {start.strftime('%d.%m')} – {end.strftime('%d.%m')}")
+    lines.append("")
+
+    day_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+    any_events = False
+
+    for i in range(7):
+        d = start + timedelta(days=i)
+        events = parse_events_for_date(ics, d)
+
+        lines.append(f"🟦 {day_names[i]} • {d.strftime('%d.%m')}")
+        if not events:
+            lines.append("  — (пар немає)")
+            lines.append("")
+            continue
+
+        any_events = True
+        for e in events:
+            st = e["start"].astimezone(KYIV_TZ).strftime("%H:%M")
+            en = e["end"].astimezone(KYIV_TZ).strftime("%H:%M") if e["end"] else ""
+            time_str = f"{st}–{en}" if en else st
+
+            place = ""
+            if e.get("format") == "Online":
+                place = "🌐 Online"
+            elif e.get("format") == "Offline":
+                pl = (e.get("place") or "").strip()
+                place = f"🏫 {pl}" if pl else "🏫 Offline"
+
+            lines.append(f"  🕒 {time_str} • {e['subject']}" + (f" • {place}" if place else ""))
+
+        lines.append("")
+
+    if not any_events:
+        lines.append("🫡 На тиждень подій не знайдено.")
+
+    lines.append(f"⏱ Оновлено: {kyiv_now().strftime('%H:%M')}")
+    return "\n".join(lines)
+
+
+# ---------------------------
+# Posting rules
+# ---------------------------
+
 def should_post_now(mode: str) -> bool:
     h, m = POST_RULES.get(mode, (8, 0))
     now = kyiv_now()
@@ -442,6 +524,27 @@ def main():
     st = load_state()
     now = kyiv_now()
 
+    # WEEKLY MODE (post to topic)
+    if MODE == "week":
+        monday = next_week_monday_from_sunday(now)
+        stamp_key = "last_post_week_monday"
+        stamp_val = monday.strftime("%Y-%m-%d")
+
+        if st.get(stamp_key) == stamp_val:
+            return
+
+        ics = fetch_ics()
+        msg = format_week_schedule(ics, monday)
+
+        # If no thread id provided, fallback to main chat
+        tg_send(msg, thread_id=TG_SCHEDULE_THREAD_ID)
+
+        st[stamp_key] = stamp_val
+        st[f"{stamp_key}_kyiv_time"] = kyiv_now().strftime("%Y-%m-%d %H:%M")
+        save_state(st)
+        return
+
+    # DAILY MODES
     if MODE == "tomorrow":
         target_date = now.date() + timedelta(days=1)
         stamp_key = "last_post_tomorrow_date"
@@ -459,7 +562,7 @@ def main():
 
     ics = fetch_ics()
     events = parse_events_for_date(ics, target_date)
-    msg = format_schedule(events, target_date, MODE)
+    msg = format_day_schedule(events, target_date, MODE)
     tg_send(msg)
 
     st[stamp_key] = target_str
