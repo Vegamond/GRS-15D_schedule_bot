@@ -1,0 +1,41 @@
+name: Schedule - Week
+
+on:
+  schedule:
+    - cron: "*/15 16-20 * * 0"   # Sunday UTC window (safe for DST)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: schedule-week
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Post schedule (week)
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GCAL_ICS_URL: ${{ secrets.GCAL_ICS_URL }}
+          TG_SCHEDULE_THREAD_ID: ${{ secrets.TG_SCHEDULE_THREAD_ID }}
+          MODE: "week"
+        run: python calendar_bot.py
+
+      - name: Commit state
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add state.json || true
+          git commit -m "Update schedule state (week)" || true
+          git pull --rebase || true
+          git push || true
