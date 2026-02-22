@@ -1,566 +1,515 @@
-import argparse
-import datetime as dt
-import json
 import os
+import json
 import re
-import sys
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
-import requests
-from icalendar import Calendar
+import urllib.request
+import urllib.parse
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
-DNIPRO_LAT = 48.4647
-DNIPRO_LON = 35.0462
 
+
+# ----------------------------
+# Helpers: IO / state
+# ----------------------------
 STATE_FILE = "state.json"
 
-EMOJI = {
-    "morning": "🌅",
-    "evening": "🌙",
-    "week": "🗓️",
-    "calendar": "📅",
-    "weather": "⛅",
-    "updated": "🕒",
-    "lesson": "📌",
-    "time": "🕒",
-    "teacher": "👩‍🏫",
-    "type": "📚",
-    "place": "🌐",
-    "link": "🔗",
-    "code": "🔑",
-    "no_lessons": "— (пар немає)",
-    "blue_day": "🟦",
-}
-
-# ---------- Models ----------
-
-@dataclass
-class Event:
-    start: dt.datetime
-    end: dt.datetime
-    summary: str
-    location: str
-    description: str
-
-    def is_online(self) -> bool:
-        text = f"{self.location}\n{self.description}".lower()
-        return "zoom" in text or "online" in text or "meet.google.com" in text
-
-# ---------- Utils ----------
-
-def load_env_required(name: str) -> str:
-    v = os.getenv(name, "").strip()
-    if not v:
-        raise RuntimeError(f"Missing env: {name}")
-    return v
-
-def read_state() -> Dict:
+def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"last_posted": {}}
+        return {}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"last_posted": {}}
+        return {}
 
-def write_state(state: Dict) -> None:
+def save_state(state: dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-def now_kyiv() -> dt.datetime:
-    return dt.datetime.now(tz=KYIV_TZ)
+def state_key_for_mode(mode: str) -> str:
+    return f"last_post_{mode}"
 
-def in_window(now_local: dt.datetime, hh: int, mm: int, window_minutes: int = 10) -> bool:
-    """True if now is between hh:mm and hh:mm+window_minutes (local time)."""
-    start = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    end = start + dt.timedelta(minutes=window_minutes)
-    return start <= now_local < end
+def already_posted_today(state: dict, mode: str) -> bool:
+    key = state_key_for_mode(mode)
+    today_str = datetime.now(KYIV_TZ).date().isoformat()
+    return state.get(key) == today_str
 
-def today_date(now_local: dt.datetime) -> dt.date:
-    return now_local.date()
+def mark_posted_today(state: dict, mode: str):
+    key = state_key_for_mode(mode)
+    state[key] = datetime.now(KYIV_TZ).date().isoformat()
 
-def tomorrow_date(now_local: dt.datetime) -> dt.date:
-    return (now_local + dt.timedelta(days=1)).date()
 
-def sunday_week_key(d: dt.date) -> str:
-    # ISO week key like 2026-W08
-    iso = d.isocalendar()
-    return f"{iso.year}-W{iso.week:02d}"
+# ----------------------------
+# Telegram
+# ----------------------------
+def tg_send_message(text: str, thread_id: int | None = None, disable_preview: bool = True):
+    token = os.environ.get("TG_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TG_CHAT_ID", "").strip()
 
-def date_title_ua(d: dt.date) -> str:
-    return d.strftime("%d.%m")
+    if not token or not chat_id:
+        raise RuntimeError("Missing TG_BOT_TOKEN or TG_CHAT_ID in environment.")
 
-def weekday_short_ua(d: dt.date) -> str:
-    # Пн, Вт, Ср, Чт, Пт, Сб, Нд
-    wd = d.weekday()
-    return ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"][wd]
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-def normalize_time(s: dt.datetime) -> str:
-    return s.astimezone(KYIV_TZ).strftime("%H:%M")
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True if disable_preview else False,
+    }
 
-def safe_text(s: str) -> str:
-    # plain text: keep as-is but strip weird nulls
-    return (s or "").replace("\x00", "").strip()
+    # IMPORTANT: for forum topics/threads
+    if thread_id is not None:
+        payload["message_thread_id"] = int(thread_id)
 
-# ---------- Calendar (ICS) ----------
+    data = urllib.parse.urlencode(payload).encode("utf-8")
 
-def fetch_ics(url: str, timeout: int = 30) -> bytes:
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "GRS-15D-schedule-bot/1.0"})
-    r.raise_for_status()
-    return r.content
+    req = urllib.request.Request(url, data=data, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read().decode("utf-8", errors="ignore")
+        return body
 
-def parse_ics_events(ics_bytes: bytes) -> List[Event]:
-    cal = Calendar.from_ical(ics_bytes)
-    events: List[Event] = []
-    for component in cal.walk():
-        if component.name != "VEVENT":
-            continue
 
-        summary = safe_text(str(component.get("summary", "")))
-        location = safe_text(str(component.get("location", "")))
-        description = safe_text(str(component.get("description", "")))
-
-        dtstart = component.get("dtstart")
-        dtend = component.get("dtend")
-
-        if not dtstart or not dtend:
-            continue
-
-        start = dtstart.dt
-        end = dtend.dt
-
-        # Ensure timezone-aware
-        if isinstance(start, dt.date) and not isinstance(start, dt.datetime):
-            # all-day event -> ignore for schedule bot
-            continue
-        if isinstance(end, dt.date) and not isinstance(end, dt.datetime):
-            continue
-
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=KYIV_TZ)
-        if end.tzinfo is None:
-            end = end.replace(tzinfo=KYIV_TZ)
-
-        events.append(Event(start=start, end=end, summary=summary, location=location, description=description))
-
-    events.sort(key=lambda e: e.start)
-    return events
-
-def events_for_date(events: List[Event], day: dt.date) -> List[Event]:
-    out = []
-    for e in events:
-        if e.start.astimezone(KYIV_TZ).date() == day:
-            out.append(e)
-    out.sort(key=lambda e: e.start)
-    return out
-
-def events_for_week(events: List[Event], start_day: dt.date, days: int = 7) -> Dict[dt.date, List[Event]]:
-    m: Dict[dt.date, List[Event]] = {}
-    for i in range(days):
-        d = start_day + dt.timedelta(days=i)
-        m[d] = events_for_date(events, d)
-    return m
-
-# ---------- Extract structured info from description ----------
-
-URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
-
-def extract_first_url_from_text(text: str) -> Optional[str]:
-    m = URL_RE.search(text or "")
-    return m.group(0) if m else None
-
-def extract_teacher(desc: str) -> Optional[str]:
-    """
-    Tries to extract teacher line like:
-    - 'доц. Плещан Х.В.'
-    - 'доц. Применко В.Г.'
-    - 'Викл. Руденко А.В.'
-    """
-    if not desc:
-        return None
-
-    # Common prefixes
-    patterns = [
-        r"(?im)^\s*(доц\.\s*[^\n]+)$",
-        r"(?im)^\s*(викл\.\s*[^\n]+)$",
-        r"(?im)^\s*(проф\.\s*[^\n]+)$",
-        r"(?im)^\s*(асист\.\s*[^\n]+)$",
-    ]
-    for p in patterns:
-        m = re.search(p, desc)
-        if m:
-            return safe_text(m.group(1))
-
-    # Sometimes in the middle: "Доц: Плещан Х.В."
-    m2 = re.search(r"(?im)\b(доц|викл|проф|асист)\s*[:\-]\s*([^\n]+)", desc)
-    if m2:
-        return safe_text(f"{m2.group(1)}. {m2.group(2)}".replace("..", "."))
-
-    return None
-
-def extract_access_code(desc: str) -> Optional[str]:
-    """
-    Looks for:
-    - 'Код доступу: Kuk-2022'
-    - 'Код: 12345'
-    """
-    if not desc:
-        return None
-    m = re.search(r"(?im)\bкод\s+доступу\s*[:\-]\s*([^\n]+)", desc)
-    if m:
-        return safe_text(m.group(1))
-    m = re.search(r"(?im)\bpasscode\s*[:\-]\s*([^\n]+)", desc)
-    if m:
-        return safe_text(m.group(1))
-    return None
-
-def extract_place(event: Event) -> str:
-    # Prefer "Online" wording if online, else use location if present
-    loc = safe_text(event.location)
-    desc = safe_text(event.description)
-    text = f"{loc}\n{desc}".lower()
-
-    if "aud." in text or "ауд." in text:
-        # Keep whatever has auditorium in it
-        # Try to return a short phrase containing "ауд"
-        m = re.search(r"(?i)(ауд\.\s*\d+)", f"{loc}\n{desc}")
-        if m:
-            return f"Online (Zoom) / {m.group(1)}" if event.is_online() else m.group(1)
-
-    if event.is_online():
-        return "Online (Zoom)"
-    if loc:
-        return loc
-    return "Очно"
-
-def extract_main_link(event: Event) -> Optional[str]:
-    # Requirement: remove the "upper link" and keep only the one in description.
-    # So: first URL from description ONLY.
-    return extract_first_url_from_text(event.description)
-
-# ---------- Weather (Open-Meteo, no key) ----------
-
-def weather_code_to_emoji(code: int) -> str:
-    # Open-Meteo WMO weather codes: https://open-meteo.com/en/docs
-    if code in (0,):
-        return "☀️"
-    if code in (1, 2, 3):
-        return "⛅"
-    if code in (45, 48):
-        return "🌫️"
-    if code in (51, 53, 55, 56, 57):
-        return "🌦️"
-    if code in (61, 63, 65, 66, 67):
-        return "🌧️"
-    if code in (71, 73, 75, 77):
-        return "🌨️"
-    if code in (80, 81, 82):
-        return "🌧️"
-    if code in (85, 86):
-        return "🌨️"
-    if code in (95, 96, 99):
-        return "⛈️"
-    return "🌤️"
-
-def fetch_weather_daily(day: dt.date) -> Optional[Dict]:
-    """
-    Returns weather dict for that date:
-    { "desc": "...", "tmin": ..., "tmax": ..., "precip_prob": ..., "emoji": "..." }
-    """
-    # We'll ask for daily forecast and pick index by date.
+# ----------------------------
+# Weather (Dnipro) via Open-Meteo (no key)
+# ----------------------------
+def fetch_weather(day: date) -> dict | None:
+    # Dnipro approx coords
+    lat, lon = 48.4647, 35.0462
+    # Open-Meteo daily forecast
     url = (
-        "https://api.open-meteo.com/v1/forecast"
-        f"?latitude={DNIPRO_LAT}&longitude={DNIPRO_LON}"
+        "https://api.open-meteo.com/v1/forecast?"
+        f"latitude={lat}&longitude={lon}"
         "&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
         "&timezone=Europe%2FKyiv"
     )
-    try:
-        r = requests.get(url, timeout=20, headers={"User-Agent": "GRS-15D-schedule-bot/1.0"})
-        r.raise_for_status()
-        data = r.json()
-        daily = data.get("daily", {})
-        dates = daily.get("time", [])
-        if not dates:
-            return None
-        if day.isoformat() not in dates:
-            return None
-        i = dates.index(day.isoformat())
 
-        code = int(daily.get("weathercode", [None])[i])
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+        data = json.loads(raw)
+        daily = data.get("daily", {})
+        times = daily.get("time", [])
+        if not times:
+            return None
+
+        day_str = day.isoformat()
+        if day_str not in times:
+            return None
+
+        i = times.index(day_str)
+        wcode = daily.get("weathercode", [None])[i]
         tmax = daily.get("temperature_2m_max", [None])[i]
         tmin = daily.get("temperature_2m_min", [None])[i]
-        pprob = daily.get("precipitation_probability_max", [None])[i]
-
-        emoji = weather_code_to_emoji(code)
-
-        # Very simple UA-ish description (not perfect, but readable)
-        desc = {
-            0: "ясно",
-            1: "переважно ясно",
-            2: "мінлива хмарність",
-            3: "хмарно",
-            45: "туман",
-            48: "туман",
-            51: "мряка",
-            53: "мряка",
-            55: "мряка",
-            61: "дощ",
-            63: "дощ",
-            65: "сильний дощ",
-            71: "сніг",
-            73: "сніг",
-            75: "сильний сніг",
-            80: "зливи",
-            81: "зливи",
-            82: "сильні зливи",
-            85: "снігопад",
-            86: "сильний снігопад",
-            95: "гроза",
-            96: "гроза",
-            99: "гроза",
-        }.get(code, "погода")
+        pop = daily.get("precipitation_probability_max", [None])[i]
 
         return {
-            "emoji": emoji,
-            "desc": desc,
-            "tmin": tmin,
+            "weathercode": wcode,
             "tmax": tmax,
-            "precip_prob": pprob,
+            "tmin": tmin,
+            "pop": pop,
         }
     except Exception:
         return None
 
-def format_weather_block(day: dt.date, label: str) -> str:
-    w = fetch_weather_daily(day)
+def weather_emoji(wcode: int | None) -> str:
+    # Very rough mapping
+    if wcode is None:
+        return "🌡️"
+    if wcode in (0, 1):
+        return "☀️"
+    if wcode in (2, 3):
+        return "⛅"
+    if wcode in (45, 48):
+        return "🌫️"
+    if wcode in (51, 53, 55, 61, 63, 65, 80, 81, 82):
+        return "🌧️"
+    if wcode in (66, 67):
+        return "🌧️❄️"
+    if wcode in (71, 73, 75, 77, 85, 86):
+        return "❄️"
+    if wcode in (95, 96, 99):
+        return "⛈️"
+    return "🌦️"
+
+def weather_text(mode: str) -> str:
+    # mode: today / tomorrow
+    now = datetime.now(KYIV_TZ)
+    day = now.date() if mode == "today" else (now.date() + timedelta(days=1))
+
+    w = fetch_weather(day)
     if not w:
         return ""
-    lines = []
-    lines.append(f"{EMOJI['weather']} Погода в Дніпрі {label}:")
-    lines.append(f"{w['emoji']} {w['desc']}")
-    if w["tmin"] is not None and w["tmax"] is not None:
-        lines.append(f"🌡️ Мін/Макс: {w['tmin']}°C / {w['tmax']}°C")
-    if w["precip_prob"] is not None:
-        lines.append(f"☔ Ймовірність опадів: {w['precip_prob']}%")
-    return "\n".join(lines) + "\n\n"
 
-# ---------- Formatting ----------
+    em = weather_emoji(w["weathercode"])
+    pop = w.get("pop")
+    tmin = w.get("tmin")
+    tmax = w.get("tmax")
 
-def format_today(events: List[Event], day: dt.date) -> str:
-    header = f"Доброго ранку шановні студенти! {EMOJI['morning']}\n{EMOJI['calendar']} Розклад на сьогодні ({date_title_ua(day)})\n\n"
-    weather = format_weather_block(day, "на сьогодні")
-    body = format_events_detailed(events) if events else f"{EMOJI['no_lessons']}\n"
-    updated = f"\n{EMOJI['updated']} Оновлено: {now_kyiv().strftime('%H:%M')}"
-    return header + weather + body + updated
+    day_label = "сьогодні" if mode == "today" else "завтра"
+    parts = []
+    parts.append(f"{em} Погода в Дніпрі на {day_label}:")
+    if tmin is not None and tmax is not None:
+        parts.append(f"🌡️ Мін/Макс: {int(round(tmin))}°C / {int(round(tmax))}°C")
+    if pop is not None:
+        parts.append(f"☔ Ймовірність опадів: {int(round(pop))}%")
+    return "\n".join(parts)
 
-def format_tomorrow(events: List[Event], day: dt.date) -> str:
-    header = f"Добрий вечір шановні студенти! {EMOJI['evening']}\n{EMOJI['calendar']} Розклад на завтра ({date_title_ua(day)})\n\n"
-    weather = format_weather_block(day, "на завтра")
-    body = format_events_detailed(events) if events else f"{EMOJI['no_lessons']}\n"
-    updated = f"\n{EMOJI['updated']} Оновлено: {now_kyiv().strftime('%H:%M')}"
-    return header + weather + body + updated
 
-def format_events_detailed(events: List[Event]) -> str:
-    lines: List[str] = []
-    for i, e in enumerate(events, 1):
-        st = normalize_time(e.start)
-        en = normalize_time(e.end)
+# ----------------------------
+# ICS parsing
+# ----------------------------
+def fetch_ics_text() -> str:
+    ics_url = os.environ.get("GCAL_ICS_URL", "").strip()
+    if not ics_url:
+        raise RuntimeError("Missing GCAL_ICS_URL in environment.")
+    with urllib.request.urlopen(ics_url, timeout=30) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore")
+    return raw
 
-        teacher = extract_teacher(e.description) or ""
-        access_code = extract_access_code(e.description)
-        place = extract_place(e)
-        link = extract_main_link(e)
-
-        # Title line
-        lines.append(f"{EMOJI['lesson']} {i}. {safe_text(e.summary).upper()}")
-        # Time
-        lines.append(f"{EMOJI['time']} {st}–{en}")
-        # Type (we infer from title sometimes; leave as "Лекція" if present)
-        # If summary already includes "Лекція/Практика" we don't duplicate.
-        if "лекц" in e.summary.lower():
-            lines.append(f"{EMOJI['type']} Лекція")
-        elif "практ" in e.summary.lower():
-            lines.append(f"{EMOJI['type']} Практика")
+def unfold_ics_lines(ics: str) -> list[str]:
+    # ICS line folding: lines that start with space are continuation
+    lines = ics.splitlines()
+    out = []
+    for line in lines:
+        if line.startswith(" ") or line.startswith("\t"):
+            if out:
+                out[-1] += line[1:]
+            else:
+                out.append(line.strip())
         else:
-            lines.append(f"{EMOJI['type']} Заняття")
+            out.append(line.rstrip("\r\n"))
+    return out
 
+def parse_ics_datetime(value: str) -> datetime | None:
+    # Supports:
+    #  - 20260218T090000Z
+    #  - 20260218T090000
+    #  - 20260218 (all-day)
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        if value.endswith("Z") and "T" in value:
+            dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=ZoneInfo("UTC"))
+            return dt.astimezone(KYIV_TZ)
+        if "T" in value:
+            dt = datetime.strptime(value, "%Y%m%dT%H%M%S").replace(tzinfo=KYIV_TZ)
+            return dt
+        # all-day
+        d = datetime.strptime(value, "%Y%m%d").date()
+        return datetime(d.year, d.month, d.day, 0, 0, tzinfo=KYIV_TZ)
+    except Exception:
+        return None
+
+def parse_event_block(block: list[str]) -> dict:
+    ev = {
+        "summary": "",
+        "description": "",
+        "location": "",
+        "dtstart": None,
+        "dtend": None,
+    }
+    for line in block:
+        if line.startswith("SUMMARY"):
+            ev["summary"] = line.split(":", 1)[-1].strip()
+        elif line.startswith("DESCRIPTION"):
+            ev["description"] = line.split(":", 1)[-1].replace("\\n", "\n").strip()
+        elif line.startswith("LOCATION"):
+            ev["location"] = line.split(":", 1)[-1].replace("\\n", "\n").strip()
+        elif line.startswith("DTSTART"):
+            val = line.split(":", 1)[-1].strip()
+            ev["dtstart"] = parse_ics_datetime(val)
+        elif line.startswith("DTEND"):
+            val = line.split(":", 1)[-1].strip()
+            ev["dtend"] = parse_ics_datetime(val)
+    return ev
+
+def parse_ics_events(ics: str) -> list[dict]:
+    lines = unfold_ics_lines(ics)
+    events = []
+    cur = None
+
+    for line in lines:
+        if line == "BEGIN:VEVENT":
+            cur = []
+        elif line == "END:VEVENT":
+            if cur is not None:
+                events.append(parse_event_block(cur))
+            cur = None
+        else:
+            if cur is not None:
+                cur.append(line)
+    # filter invalid
+    out = []
+    for e in events:
+        if e["dtstart"] is None:
+            continue
+        out.append(e)
+    return out
+
+
+# ----------------------------
+# Extract structured fields from description
+# ----------------------------
+TEACHER_RE = re.compile(r"(?im)^(?:викл\.|доц\.|проф\.|ас\.\s*проф\.|ст\.\s*викл\.)\s*(.+)$")
+ACCESS_CODE_RE = re.compile(r"(?im)код\s*доступу\s*[:\-]\s*(.+)$")
+URL_RE = re.compile(r"https?://\S+")
+
+def extract_teacher(description: str) -> str | None:
+    if not description:
+        return None
+    m = TEACHER_RE.search(description)
+    if m:
+        return m.group(1).strip()
+    # Sometimes teacher is like "Доц. Плещан Х.В." (capitalized)
+    m2 = re.search(r"(?im)^(Доц\.|Викл\.)\s*(.+)$", description)
+    if m2:
+        return m2.group(0).strip()
+    return None
+
+def extract_access_code(description: str) -> str | None:
+    if not description:
+        return None
+    m = ACCESS_CODE_RE.search(description)
+    if m:
+        return m.group(1).strip()
+    return None
+
+def extract_links(description: str) -> list[str]:
+    if not description:
+        return []
+    links = URL_RE.findall(description)
+    # de-dup, keep order
+    seen = set()
+    out = []
+    for u in links:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+def normalize_lesson_type(summary: str, description: str) -> str:
+    text = f"{summary}\n{description}".lower()
+    if "практ" in text:
+        return "Практичне"
+    if "лекц" in text:
+        return "Лекція"
+    if "сем" in text:
+        return "Семінар"
+    return "Заняття"
+
+def format_location(description: str, location: str) -> str:
+    # If location already has Online / Zoom / ауд.
+    text = f"{location}\n{description}".lower()
+    if "online" in text or "zoom" in text:
+        # try to include "(Zoom)" and/or "ауд."
+        # Keep short:
+        if "ауд" in text:
+            # find "ауд. 207" etc
+            m = re.search(r"(ауд\.?\s*\d+)", f"{location}\n{description}", flags=re.IGNORECASE)
+            if m:
+                return f"Online (Zoom, {m.group(1)})"
+        return "Online (Zoom)"
+    if location:
+        return location.strip()
+    return "Аудиторія (не вказано)"
+
+
+# ----------------------------
+# Formatting
+# ----------------------------
+WEEKDAY_UA = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+
+def fmt_time(dt: datetime) -> str:
+    return dt.strftime("%H:%M")
+
+def fmt_date_short(d: date) -> str:
+    return d.strftime("%d.%m")
+
+def greeting_for_mode(mode: str) -> str:
+    if mode == "today":
+        return "Доброго ранку шановні студенти! ☀️"
+    if mode == "tomorrow":
+        return "Добрий вечір шановні студенти! 🌙"
+    if mode == "week":
+        return "🗓️ Розклад на тиждень"
+    return "Розклад"
+
+def header_icon_for_mode(mode: str) -> str:
+    if mode == "today":
+        return "📅"
+    if mode == "tomorrow":
+        return "📅"
+    if mode == "week":
+        return "🗓️"
+    return "📅"
+
+def format_day_schedule(events: list[dict], day: date, title_prefix: str) -> str:
+    # Sort events by start time
+    day_events = [e for e in events if e["dtstart"].date() == day]
+    day_events.sort(key=lambda x: x["dtstart"])
+
+    title = f"{header_icon_for_mode('today')} {title_prefix} ({day.strftime('%d.%m')})"
+    lines = [title]
+
+    if not day_events:
+        lines.append("— Пар немає ✅")
+        return "\n".join(lines)
+
+    for idx, e in enumerate(day_events, start=1):
+        summary = (e.get("summary") or "").strip()
+        desc = (e.get("description") or "").strip()
+        loc = (e.get("location") or "").strip()
+
+        dt1 = e["dtstart"]
+        dt2 = e.get("dtend") or (dt1 + timedelta(minutes=80))
+
+        lesson_type = normalize_lesson_type(summary, desc)
+        teacher = extract_teacher(desc)
+        access = extract_access_code(desc)
+        links = extract_links(desc)
+
+        place = format_location(desc, loc)
+
+        # Subject line
+        lines.append("")
+        lines.append(f"📌 {idx}. {summary.upper() if summary else 'ЗАНЯТТЯ'}")
+        lines.append(f"🕒 {fmt_time(dt1)}–{fmt_time(dt2)}")
+        lines.append(f"📚 {lesson_type}")
         if teacher:
-            # normalize "Викл." -> "Викл."
-            lines.append(f"{EMOJI['teacher']} {teacher}")
+            lines.append(f"👨‍🏫 {teacher}")
+        lines.append(f"🌐 {place}")
 
-        lines.append(f"{EMOJI['place']} {place}")
+        # link: keep only the first link if many
+        if links:
+            lines.append(f"🔗 {links[0]}")
+        if access:
+            lines.append(f"🔐 Код доступу: {access}")
 
-        if link:
-            lines.append(f"{EMOJI['link']} {link}")
-        if access_code:
-            lines.append(f"{EMOJI['code']} Код доступу: {access_code}")
+    lines.append("")
+    lines.append(f"🕘 Оновлено: {datetime.now(KYIV_TZ).strftime('%H:%M')}")
+    return "\n".join(lines)
 
-        lines.append("")  # blank line between lessons
+def format_week_schedule(events: list[dict], start_day: date) -> str:
+    # Week: Mon..Sun of the week containing start_day
+    monday = start_day - timedelta(days=start_day.weekday())
+    sunday = monday + timedelta(days=6)
 
-    return "\n".join(lines).rstrip() + "\n"
+    lines = [greeting_for_mode("week")]
+    lines.append(f"{fmt_date_short(monday)} – {fmt_date_short(sunday)}")
+    lines.append("")
 
-def format_week(week_map: Dict[dt.date, List[Event]], start_day: dt.date) -> str:
-    end_day = start_day + dt.timedelta(days=6)
-    header = f"{EMOJI['week']} Розклад на тиждень\n{date_title_ua(start_day)} – {date_title_ua(end_day)}\n\n"
-    lines: List[str] = [header]
+    # group per day
+    for i in range(7):
+        d = monday + timedelta(days=i)
+        day_events = [e for e in events if e["dtstart"].date() == d]
+        day_events.sort(key=lambda x: x["dtstart"])
 
-    for d in sorted(week_map.keys()):
-        day_events = week_map[d]
-        lines.append(f"{EMOJI['blue_day']} {weekday_short_ua(d)} • {date_title_ua(d)}")
+        wd = WEEKDAY_UA[i]
+        lines.append(f"🟦 {wd} • {fmt_date_short(d)}")
+
         if not day_events:
-            lines.append(f"{EMOJI['no_lessons']}\n")
+            lines.append("— (пар немає)")
+            lines.append("")
             continue
 
         for e in day_events:
-            st = normalize_time(e.start)
-            en = normalize_time(e.end)
-            online = "🌐 Online" if e.is_online() else "🏫 Очно"
-            # compact line:
-            # 🕒 09:00–10:20 • Історія України • 🌐 Online
-            lines.append(f"{EMOJI['time']} {st}–{en} • {safe_text(e.summary)} • {online}")
+            summary = (e.get("summary") or "").strip()
+            desc = (e.get("description") or "").strip()
+            loc = (e.get("location") or "").strip()
 
-            link = extract_main_link(e)
-            if link:
-                lines.append(f"{EMOJI['link']} {link}")
+            dt1 = e["dtstart"]
+            dt2 = e.get("dtend") or (dt1 + timedelta(minutes=80))
 
-        lines.append("")  # blank line after each day
+            lesson_type = normalize_lesson_type(summary, desc)
+            teacher = extract_teacher(desc)
+            place = format_location(desc, loc)
+            access = extract_access_code(desc)
+            links = extract_links(desc)
 
-    lines.append(f"{EMOJI['updated']} Оновлено: {now_kyiv().strftime('%H:%M')}")
-    return "\n".join(lines).rstrip() + "\n"
+            # компактно, але структурно (як ти просив)
+            lines.append(f"🕒 {fmt_time(dt1)}–{fmt_time(dt2)}")
+            lines.append(f"📌 {summary}")
+            lines.append(f"📚 {lesson_type}")
+            if teacher:
+                lines.append(f"👨‍🏫 {teacher}")
+            lines.append(f"🌐 {place}")
+            if links:
+                lines.append(f"🔗 {links[0]}")
+            if access:
+                lines.append(f"🔐 Код доступу: {access}")
+            lines.append("")
 
-# ---------- Telegram ----------
+        lines.append("")
 
-def tg_send(text: str, thread_id: Optional[int]) -> None:
-    token = load_env_required("TG_BOT_TOKEN")
-    chat_id = load_env_required("TG_CHAT_ID")
+    lines.append(f"🕘 Оновлено: {datetime.now(KYIV_TZ).strftime('%H:%M')}")
+    return "\n".join(lines)
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
-    if thread_id is not None:
-        payload["message_thread_id"] = int(thread_id)
 
-    r = requests.post(url, json=payload, timeout=30)
-    if not r.ok:
-        raise RuntimeError(f"Telegram sendMessage failed: {r.status_code} {r.text}")
+# ----------------------------
+# Main
+# ----------------------------
+def main():
+    mode = (os.environ.get("MODE") or "").strip().lower()
+    if mode not in ("today", "tomorrow", "week"):
+        # allow CLI: python calendar_bot.py today
+        import sys
+        if len(sys.argv) >= 2:
+            mode = sys.argv[1].strip().lower()
+    if mode not in ("today", "tomorrow", "week"):
+        raise RuntimeError("MODE must be one of: today, tomorrow, week")
 
-# ---------- Main logic ----------
+    state = load_state()
 
-def should_post(mode: str, force: bool) -> Tuple[bool, str]:
-    """
-    Returns (should_post, state_key)
-    state_key is used to store last posted in state.json
-    """
-    now = now_kyiv()
-    state_key = ""
-
-    if force:
-        if mode == "today":
-            state_key = today_date(now).isoformat()
-        elif mode == "tomorrow":
-            state_key = tomorrow_date(now).isoformat()
-        elif mode == "week":
-            # key for the week starting Monday of current week
-            monday = (now.date() - dt.timedelta(days=now.date().weekday()))
-            state_key = sunday_week_key(monday)
-        return True, state_key
-
-    if mode == "today":
-        if not in_window(now, 8, 0, window_minutes=15):
-            return False, ""
-        state_key = today_date(now).isoformat()
-        return True, state_key
-
-    if mode == "tomorrow":
-        if not in_window(now, 19, 0, window_minutes=15):
-            return False, ""
-        state_key = tomorrow_date(now).isoformat()
-        return True, state_key
-
-    if mode == "week":
-        # Post on Sunday into schedule thread (e.g., at 21:00) — you can adjust
-        # Here: Sunday 21:00 Kyiv
-        if now.weekday() != 6:
-            return False, ""
-        if not in_window(now, 21, 0, window_minutes=30):
-            return False, ""
-        # week starting Monday (tomorrow if today is Sunday? Actually next week starts tomorrow)
-        next_monday = (now.date() + dt.timedelta(days=1))
-        state_key = sunday_week_key(next_monday)
-        return True, state_key
-
-    return False, ""
-
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["today", "tomorrow", "week"])
-    ap.add_argument("--force", action="store_true", help="Post immediately (ignores time window/state)")
-    args = ap.parse_args()
-
-    # Required env
-    gcal_url = load_env_required("GCAL_ICS_URL")
-    # Telegram env checked inside tg_send
-
-    state = read_state()
-    last_posted = state.get("last_posted", {})
-
-    ok_to_post, state_key = should_post(args.mode, args.force)
-    if not ok_to_post:
-        print("Not in posting window. Exiting.")
+    # Prevent duplicates (but allow manual FORCE=1)
+    force = os.environ.get("FORCE", "0").strip() == "1"
+    if not force and already_posted_today(state, mode):
+        print(f"Already posted for mode={mode} today. Exiting.")
         return
 
-    # Idempotency: avoid double posts for same date/week
-    prev_key = last_posted.get(args.mode)
-    if (not args.force) and prev_key == state_key:
-        print(f"Already posted for {args.mode}: {state_key}. Exiting.")
-        return
-
-    ics = fetch_ics(gcal_url)
+    ics = fetch_ics_text()
     events = parse_ics_events(ics)
 
-    now = now_kyiv()
+    now = datetime.now(KYIV_TZ)
+    if mode == "today":
+        day = now.date()
+        msg_parts = [greeting_for_mode("today")]
+        w = weather_text("today")
+        if w:
+            msg_parts.append("")
+            msg_parts.append(w)
+            msg_parts.append("")
+        msg_parts.append(format_day_schedule(events, day, "Розклад на сьогодні"))
+        message = "\n".join(msg_parts)
+        # Post to general (no thread_id)
+        tg_send_message(message, thread_id=None, disable_preview=True)
 
-    if args.mode == "today":
-        day = today_date(now)
-        day_events = events_for_date(events, day)
-        msg = format_today(day_events, day)
-        # post to main chat (no thread_id)
-        tg_send(msg, thread_id=None)
+    elif mode == "tomorrow":
+        day = now.date() + timedelta(days=1)
+        msg_parts = [greeting_for_mode("tomorrow")]
+        w = weather_text("tomorrow")
+        if w:
+            msg_parts.append("")
+            msg_parts.append(w)
+            msg_parts.append("")
+        msg_parts.append(format_day_schedule(events, day, "Розклад на завтра"))
+        message = "\n".join(msg_parts)
+        tg_send_message(message, thread_id=None, disable_preview=True)
 
-    elif args.mode == "tomorrow":
-        day = tomorrow_date(now)
-        day_events = events_for_date(events, day)
-        msg = format_tomorrow(day_events, day)
-        tg_send(msg, thread_id=None)
+    elif mode == "week":
+        # IMPORTANT: post to Schedule thread
+        thread_id_raw = os.environ.get("TG_SCHEDULE_THREAD_ID", "").strip()
+        if not thread_id_raw:
+            raise RuntimeError("Missing TG_SCHEDULE_THREAD_ID for weekly posts.")
+        thread_id = int(thread_id_raw)
 
-    elif args.mode == "week":
-        # next week (Mon..Sun) if today is Sunday
-        next_monday = now.date() + dt.timedelta(days=1)
-        week_map = events_for_week(events, next_monday, days=7)
-        msg = format_week(week_map, next_monday)
+        message = format_week_schedule(events, now.date())
+        tg_send_message(message, thread_id=thread_id, disable_preview=True)
 
-        # post to Schedule thread
-        thread_id_env = os.getenv("TG_SCHEDULE_THREAD_ID", "").strip()
-        thread_id = int(thread_id_env) if thread_id_env else None
-        if thread_id is None:
-            raise RuntimeError("Missing TG_SCHEDULE_THREAD_ID for week mode.")
-        tg_send(msg, thread_id=thread_id)
-
-    # update state
-    state.setdefault("last_posted", {})
-    state["last_posted"][args.mode] = state_key
-    write_state(state)
-
-    print(f"Posted {args.mode} successfully. State updated to {state_key}.")
+    mark_posted_today(state, mode)
+    save_state(state)
+    print("Posted OK.")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(1)
+    main()
