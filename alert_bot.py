@@ -1,138 +1,211 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
 import json
-import urllib.request
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import os
+import sys
+import time
+from datetime import datetime, timezone
 
-TZ = ZoneInfo(os.getenv("TZ", "Europe/Kyiv"))
+import requests
 
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
-TG_ALERTS_THREAD_ID = os.getenv("TG_ALERTS_THREAD_ID", "").strip()
 
-ALERTS_API_KEY = os.getenv("ALERTS_API_KEY", "").strip()
-ALERTS_UID = int(os.getenv("ALERTS_UID", "332").strip())  # м. Дніпро та Дніпровська ТГ
+ALERTS_ACTIVE_URL = os.getenv(
+    "ALERTS_ACTIVE_URL",
+    # типово в alerts.in.ua часто використовують iot endpoint з активними тривогами
+    "https://alerts.in.ua/api/v1/iot/active_air_raid_alerts.json",
+)
 
-STATE_FILE = os.getenv("ALERTS_STATE_FILE", "alerts_state.json").strip()
+STATE_FILE = os.getenv("ALERTS_STATE_FILE", "alerts_state.json")
 
-# Найчастіше використовується такий endpoint у прикладах клієнтів:
-ALERTS_BASE_URL = os.getenv("ALERTS_BASE_URL", "https://alerts.com.ua").strip().rstrip("/")
-ALERTS_ENDPOINT = os.getenv("ALERTS_ENDPOINT", "/api/states").strip()
 
-def _http_get_json(url: str, timeout: int = 20) -> dict:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "GRS-15D-alert-bot/1.0",
-            "X-API-Key": ALERTS_API_KEY,
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        return json.loads(raw)
+def env_required(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(f"Missing env var: {name}")
+    return v
 
-def _http_post_json(url: str, payload: dict, timeout: int = 20) -> dict:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json", "User-Agent": "GRS-15D-alert-bot/1.0"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        return json.loads(raw)
 
 def load_state() -> dict:
+    if not os.path.exists(STATE_FILE):
+        return {"last_active": None, "last_change_ts": None}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {}
+        return {"last_active": None, "last_change_ts": None}
+
 
 def save_state(state: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-def tg_send(text: str):
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+
+def now_local_str() -> str:
+    # GitHub runner UTC; але для тексту досить “UTC+2/+3” не вираховуємо —
+    # якщо хочеш, можна додати pytz/zoneinfo. Зараз — універсально.
+    return datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+
+
+def extract_any_id(item: dict) -> set:
+    """
+    Повертає множину можливих ID зі структури елемента активної тривоги.
+    Робимо максимально толерантно до різних форматів.
+    """
+    ids = set()
+
+    # прямі поля
+    for k in ("uid", "id", "regionId", "region_id", "territoryId", "territory_id", "locationUid", "location_uid"):
+        v = item.get(k)
+        if v is not None:
+            ids.add(str(v))
+
+    # вкладені структури, які часто зустрічаються
+    for path in (
+        ("region", "uid"),
+        ("region", "id"),
+        ("territory", "uid"),
+        ("territory", "id"),
+        ("location", "uid"),
+        ("location", "id"),
+    ):
+        cur = item
+        ok = True
+        for p in path:
+            if isinstance(cur, dict) and p in cur:
+                cur = cur[p]
+            else:
+                ok = False
+                break
+        if ok and cur is not None:
+            ids.add(str(cur))
+
+    return ids
+
+
+def is_uid_active(active_payload, target_uid: str) -> bool:
+    """
+    active_payload може бути list/dict.
+    Ціль: визначити чи є target_uid у списку активних тривог.
+    Якщо UID не зустрівся — це означає “нема тривоги”, а не помилка.
+    """
+    target_uid = str(target_uid)
+
+    # інколи API повертає {"data":[...]} або {"alerts":[...]}
+    if isinstance(active_payload, dict):
+        for key in ("data", "alerts", "result", "active", "items"):
+            if key in active_payload and isinstance(active_payload[key], list):
+                active_payload = active_payload[key]
+                break
+
+    if not isinstance(active_payload, list):
+        # якщо формат взагалі неочікуваний — не падаємо, просто вважаємо “нема”
+        return False
+
+    for item in active_payload:
+        if not isinstance(item, dict):
+            continue
+        ids = extract_any_id(item)
+        if target_uid in ids:
+            return True
+
+    return False
+
+
+def tg_send_message(token: str, chat_id: str, text: str, thread_id: str | None = None) -> None:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
-        "chat_id": TG_CHAT_ID,
+        "chat_id": chat_id,
         "text": text,
-        "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    if TG_ALERTS_THREAD_ID:
-        payload["message_thread_id"] = int(TG_ALERTS_THREAD_ID)
-    resp = _http_post_json(url, payload)
-    if not resp.get("ok"):
-        raise RuntimeError(resp)
+    # Для форумних груп (topics) треба message_thread_id
+    if thread_id:
+        payload["message_thread_id"] = int(thread_id)
 
-def main():
-    if not (TG_BOT_TOKEN and TG_CHAT_ID and ALERTS_API_KEY):
-        raise RuntimeError("Потрібні TG_BOT_TOKEN, TG_CHAT_ID, ALERTS_API_KEY")
+    r = requests.post(url, json=payload, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"Telegram sendMessage failed: {r.status_code} {r.text}")
 
-    url = f"{ALERTS_BASE_URL}{ALERTS_ENDPOINT}"
-    data = _http_get_json(url)
 
-    # У різних реалізаціях структура може бути:
-    # - список об'єктів
-    # - або {"states":[...]}
-    states = data.get("states") if isinstance(data, dict) else None
-    if states is None and isinstance(data, list):
-        states = data
-    if states is None:
-        raise RuntimeError(f"Unexpected alerts response: {data}")
+def main() -> int:
+    tg_token = env_required("TG_BOT_TOKEN")
+    tg_chat_id = env_required("TG_CHAT_ID")
 
-    target = None
-    for s in states:
-        # пробуємо типові ключі
-        sid = s.get("id") or s.get("uid") or s.get("regionId") or s.get("locationId")
-        if sid == ALERTS_UID:
-            target = s
-            break
+    # topic/thread для тривог
+    tg_alerts_thread_id = os.getenv("TG_ALERTS_THREAD_ID")  # може бути None (тоді в загальний)
+    alerts_token = env_required("ALERTS_TOKEN")
+    alerts_uid = env_required("ALERTS_UID")  # у тебе: 332
 
-    if not target:
-        raise RuntimeError(f"Не знайшов UID={ALERTS_UID} у відповіді API")
+    headers = {
+        # alerts.in.ua зазвичай приймає X-API-Key, але лишаємо також Bearer як fallback
+        "X-API-Key": alerts_token,
+        "Authorization": f"Bearer {alerts_token}",
+        "Accept": "application/json",
+        "User-Agent": "GRS-15D-alert-bot/1.0",
+    }
 
-    # Нормалізуємо “чи є тривога”
-    # типові поля: alert / alarm / isAlarm / active
-    active = (
-        bool(target.get("alert"))
-        or bool(target.get("alarm"))
-        or bool(target.get("isAlarm"))
-        or bool(target.get("active"))
-    )
+    # 1) Забираємо активні тривоги
+    resp = requests.get(ALERTS_ACTIVE_URL, headers=headers, timeout=30)
+    if not resp.ok:
+        raise RuntimeError(f"alerts.in.ua request failed: {resp.status_code} {resp.text}")
 
-    # тип загрози (якщо є)
-    kind = target.get("type") or target.get("alertType") or target.get("kind") or ""
-    kind = str(kind).strip()
+    try:
+        payload = resp.json()
+    except Exception:
+        raise RuntimeError("alerts.in.ua returned non-JSON response")
 
-    now = datetime.now(TZ).strftime("%H:%M")
-    place = "м. Дніпро та Дніпровська територіальна громада"
+    active_now = is_uid_active(payload, alerts_uid)
 
+    # 2) Стан + антиспам
     state = load_state()
-    prev = state.get("active")
+    last_active = state.get("last_active", None)
 
-    # антиспам: пишемо тільки при зміні
-    if prev is None or bool(prev) != bool(active):
-        if active:
-            title = "🚨 <b>Тривога!</b>"
-            extra = f"\nТип: <b>{kind}</b>" if kind else ""
-            msg = f"{title}\n📍 {place}{extra}\n🕒 {now}"
-        else:
-            msg = f"✅ <b>Відбій</b>\n📍 {place}\n🕒 {now}"
-
-        tg_send(msg)
-
-        state["active"] = bool(active)
-        state["last_change"] = datetime.now(TZ).isoformat()
+    # first run — просто запам’ятати, не постити (щоб не “лякати” на запуску)
+    if last_active is None:
+        state["last_active"] = active_now
+        state["last_change_ts"] = int(time.time())
         save_state(state)
+        print(f"[init] active_now={active_now} (saved, no post)")
+        return 0
 
-    print("OK")
+    if bool(last_active) == bool(active_now):
+        print(f"[nochange] active_now={active_now} (no post)")
+        return 0
+
+    # 3) Є зміна: постимо
+    ts = now_local_str()
+    if active_now:
+        text = (
+            "🚨 **ПОВІТРЯНА ТРИВОГА — Дніпро**\n"
+            f"🕒 {ts}\n\n"
+            "Будь ласка, пройдіть в укриття / дотримуйтесь правил безпеки."
+        )
+    else:
+        text = (
+            "✅ **ВІДБІЙ ТРИВОГИ — Дніпро**\n"
+            f"🕒 {ts}\n\n"
+            "Можна повертатися до справ (але тримаємо голову холодною)."
+        )
+
+    # Telegram MarkdownV2 дуже вибагливий — тому без parse_mode.
+    # Якщо хочеш жирний текст — зробимо окремо, з екрануванням.
+    # Зараз лишимо “звичайний” текст (найнадійніше).
+    text = text.replace("**", "")  # прибрали “markdown” маркери
+
+    tg_send_message(tg_token, tg_chat_id, text, tg_alerts_thread_id)
+
+    state["last_active"] = active_now
+    state["last_change_ts"] = int(time.time())
+    save_state(state)
+
+    print(f"[posted] active_now={active_now}")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        raise
