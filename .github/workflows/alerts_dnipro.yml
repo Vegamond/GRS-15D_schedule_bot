@@ -1,0 +1,38 @@
+name: Alerts - Dnipro
+
+on:
+  schedule:
+    - cron: "*/2 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Poll alerts and post to Alerts thread
+        env:
+          TZ: Europe/Kyiv
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_ALERTS_THREAD_ID: ${{ secrets.TG_ALERTS_THREAD_ID }}
+          ALERTS_API_KEY: ${{ secrets.ALERTS_API_KEY }}
+          ALERTS_UID: "332"
+          ALERTS_BASE_URL: "https://alerts.com.ua"
+          ALERTS_ENDPOINT: "/api/states"
+          ALERTS_STATE_FILE: alerts_state.json
+        run: |
+          python alert_bot.py
+
+      - name: Commit alerts state
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add alerts_state.json || true
+          git commit -m "Update alerts state" || true
+          git push || true
