@@ -1,3 +1,21 @@
 {
-  "last_checked_at": "2026-02-25T13:41:06.500797+00:00"
+  "last_checked_at": "2026-02-25T14:26:50.812191+00:00",
+  "active": true,
+  "last_alert": {
+    "id": 181045,
+    "location_title": "Дніпровська територіальна громада",
+    "location_type": "hromada",
+    "started_at": "2026-02-25T14:18:27.000Z",
+    "finished_at": null,
+    "updated_at": "2026-02-25T14:18:29.361Z",
+    "alert_type": "air_raid",
+    "location_oblast": "Дніпропетровська область",
+    "location_uid": "332",
+    "notes": null,
+    "country": null,
+    "deleted_at": null,
+    "calculated": null,
+    "location_raion": "Дніпровський район",
+    "location_oblast_uid": 332
+  }
 }
