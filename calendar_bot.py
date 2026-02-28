@@ -42,6 +42,29 @@ def pair_no(t: dt.datetime) -> Optional[int]:
 
 
 # ----------------------------
+# Moodle links per discipline (independent of lecture/practice)
+# ----------------------------
+MOODLE_LINKS = {
+    "Туристичне країнознавство": "https://distance.kuk.edu.ua/course/view.php?id=8560",
+    "Готельна справа": "https://distance.kuk.edu.ua/course/view.php?id=8064",
+    "Історія України": "https://distance.kuk.edu.ua/mod/attendance/view.php?id=175144",
+    # "Ділова українська мова": "",  # додаси коли буде
+    "Культурні та креативні індустрії": "https://distance.kuk.edu.ua/course/view.php?id=2067",
+    "Барна справа": "https://distance.kuk.edu.ua/course/view.php?id=5472",
+    "Ресторанна справа": "https://distance.kuk.edu.ua/course/view.php?id=8561",
+    "Емоційний інтелект": "https://distance.kuk.edu.ua/course/view.php?id=8549",
+}
+
+
+def normalize_discipline(name: str) -> str:
+    # прибираємо зайві пробіли та уніфікуємо апострофи
+    return " ".join((name or "").replace("’", "'").split()).casefold()
+
+
+MOODLE_LINKS_NORM = {normalize_discipline(k): v for k, v in MOODLE_LINKS.items() if v}
+
+
+# ----------------------------
 # iCal unescape (RFC5545)
 # ----------------------------
 def ics_unescape(s: str) -> str:
@@ -298,8 +321,6 @@ def split_summary(summary: str) -> Tuple[str, Optional[str]]:
 def _normalize_for_links(text: str) -> str:
     if not text:
         return ""
-    # at this point description/location are already unescaped,
-    # but keep it safe if some source contains literal "\n"
     t = text.replace("\\n", "\n")
     t = t.replace("\u200b", "")
     return t
@@ -502,11 +523,20 @@ def format_day(events: List[Event], day: dt.date) -> str:
         links = extract_zoom_links(ev.description + "\n" + ev.location)
         link = links[0] if links else None
 
+        moodle_url = MOODLE_LINKS_NORM.get(normalize_discipline(discipline))
+
         pno = pair_no(ev.start)
         pfx = f"{pno} пара " if pno else ""
 
         lines.append(f"🕒 <b>{pfx}{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
         lines.append(f"📚 <b>{escape_html(discipline)}</b>")
+
+        # Moodle button/link (independent of lecture/practice)
+        if moodle_url:
+            href_m = escape_html_attr(moodle_url)
+            lines.append(f'📘 <a href="{href_m}">Відкрити Moodle</a>')
+            lines.append(f"📎 <code>{escape_html(moodle_url)}</code>")
+
         if etype:
             lines.append(f"🎓 {etype}")
         if teacher:
