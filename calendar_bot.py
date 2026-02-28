@@ -42,6 +42,20 @@ def pair_no(t: dt.datetime) -> Optional[int]:
 
 
 # ----------------------------
+# iCal unescape (RFC5545)
+# ----------------------------
+def ics_unescape(s: str) -> str:
+    if not s:
+        return ""
+    return (s
+            .replace(r"\n", "\n")
+            .replace(r"\N", "\n")
+            .replace(r"\,", ",")
+            .replace(r"\;", ";")
+            .replace(r"\\", "\\"))
+
+
+# ----------------------------
 # Models
 # ----------------------------
 @dataclass
@@ -80,9 +94,7 @@ def save_state(state: Dict) -> None:
 
 
 def should_post(state: Dict, key: str, stamp: str) -> bool:
-    """
-    Simple dedupe: post only if last_stamp != stamp
-    """
+    """Simple dedupe: post only if last_stamp != stamp"""
     last = state.get(key)
     return last != stamp
 
@@ -175,9 +187,9 @@ def parse_ics_events(ics_text: str) -> List[Event]:
 
         dtstart_tz, dtstart_val = cur.get("DTSTART", (None, ""))
         dtend_tz, dtend_val = cur.get("DTEND", (None, ""))
-        summary = cur.get("SUMMARY", (None, ""))[1]
-        description = cur.get("DESCRIPTION", (None, ""))[1]
-        location = cur.get("LOCATION", (None, ""))[1]
+        summary_raw = cur.get("SUMMARY", (None, ""))[1]
+        description_raw = cur.get("DESCRIPTION", (None, ""))[1]
+        location_raw = cur.get("LOCATION", (None, ""))[1]
 
         if not dtstart_val or not dtend_val:
             cur = {}
@@ -186,12 +198,16 @@ def parse_ics_events(ics_text: str) -> List[Event]:
         start = _parse_dt(dtstart_val, dtstart_tz)
         end = _parse_dt(dtend_val, dtend_tz)
 
+        summary = ics_unescape(summary_raw).strip()
+        description = ics_unescape(description_raw).strip()
+        location = ics_unescape(location_raw).strip()
+
         events.append(Event(
             start=start,
             end=end,
-            summary=summary.strip(),
-            description=description.strip(),
-            location=location.strip(),
+            summary=summary,
+            description=description,
+            location=location,
         ))
         cur = {}
 
@@ -230,9 +246,7 @@ def parse_ics_events(ics_text: str) -> List[Event]:
 
 
 def events_in_range(events: List[Event], start_date: dt.date, end_date: dt.date) -> List[Event]:
-    """
-    inclusive date-range by start date in Kyiv time.
-    """
+    """inclusive date-range by start date in Kyiv time."""
     out = []
     for ev in events:
         d = ev.start.astimezone(KYIV_TZ).date()
@@ -284,6 +298,8 @@ def split_summary(summary: str) -> Tuple[str, Optional[str]]:
 def _normalize_for_links(text: str) -> str:
     if not text:
         return ""
+    # at this point description/location are already unescaped,
+    # but keep it safe if some source contains literal "\n"
     t = text.replace("\\n", "\n")
     t = t.replace("\u200b", "")
     return t
@@ -292,7 +308,6 @@ def _normalize_for_links(text: str) -> str:
 def extract_zoom_links(text: str) -> List[str]:
     t = _normalize_for_links(text)
     links = URL_RE.findall(t)
-
     zoom = [l for l in links if "zoom.us" in l.lower()]
     rest = [l for l in links if l not in zoom]
     return zoom + rest
@@ -301,7 +316,7 @@ def extract_zoom_links(text: str) -> List[str]:
 def extract_teacher(description: str) -> Optional[str]:
     if not description:
         return None
-    lines = [l.strip() for l in description.replace("\\n", "\n").splitlines() if l.strip()]
+    lines = [l.strip() for l in description.splitlines() if l.strip()]
     patterns = [
         r"^(?:доц\.?|доцент)\s*[:\-]?\s*(.+)$",
         r"^(?:викл\.?|викладач)\s*[:\-]?\s*(.+)$",
@@ -319,12 +334,22 @@ def extract_teacher(description: str) -> Optional[str]:
     return None
 
 
-def extract_passcode(description: str) -> Optional[str]:
-    if not description:
+def extract_passcode(text: str) -> Optional[str]:
+    """
+    Matches:
+      - "Код: Kuk-2025"
+      - "Код доступу: Kuk-2026"
+      - "Код доступа: Kuk-2026"
+      - "Passcode: BdF5kn"
+      - "Пароль: 12345"
+    """
+    if not text:
         return None
-    t = description.replace("\\n", "\n")
+    t = text.replace("\\n", "\n")
+
     patterns = [
-        r"(?:Код доступу|Код доступа|Passcode|Пароль)\s*[:\-]?\s*([A-Za-zА-Яа-я0-9\-_]+)",
+        r"(?:Код\s*доступу|Код\s*доступа|Passcode|Пароль)\s*[:=\-]\s*([^\s,;]+)",
+        r"(?:^|\n)\s*Код\s*[:=\-]\s*([^\s,;]+)",
     ]
     for pat in patterns:
         m = re.search(pat, t, flags=re.IGNORECASE)
@@ -353,7 +378,6 @@ def classify_place(location: str, description: str) -> str:
 # ----------------------------
 def get_weather_dnipro(day: dt.date) -> Optional[Dict]:
     lat, lon = 48.45, 34.98
-
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
@@ -469,8 +493,10 @@ def format_day(events: List[Event], day: dt.date) -> str:
     for ev in events:
         discipline, etype = split_summary(ev.summary)
         teacher = extract_teacher(ev.description)
-        # ✅ Search passcode in description + location (more robust)
-        passcode = extract_passcode(ev.description + "\n" + ev.location)
+
+        # passcode can be in description/location/summary
+        passcode = extract_passcode(ev.description + "\n" + ev.location + "\n" + ev.summary)
+
         place = classify_place(ev.location, ev.description)
 
         links = extract_zoom_links(ev.description + "\n" + ev.location)
@@ -479,7 +505,6 @@ def format_day(events: List[Event], day: dt.date) -> str:
         pno = pair_no(ev.start)
         pfx = f"{pno} пара " if pno else ""
 
-        # If you want ⏰ instead of 🕒, replace here:
         lines.append(f"🕒 <b>{pfx}{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
         lines.append(f"📚 <b>{escape_html(discipline)}</b>")
         if etype:
@@ -493,7 +518,6 @@ def format_day(events: List[Event], day: dt.date) -> str:
             lines.append(f'🔗 <a href="{href}">Відкрити Zoom</a>')
             lines.append(f"📎 <code>{escape_html(link)}</code>")
 
-        # ✅ Copy-friendly passcode (like link)
         if passcode:
             lines.append("🔑 Код доступу:")
             lines.append(f"📎 <code>{escape_html(passcode)}</code>")
