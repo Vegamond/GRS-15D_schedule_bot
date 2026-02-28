@@ -57,7 +57,6 @@ MOODLE_LINKS = {
 
 
 def normalize_discipline(name: str) -> str:
-    # прибираємо зайві пробіли та уніфікуємо апострофи
     return " ".join((name or "").replace("’", "'").split()).casefold()
 
 
@@ -117,7 +116,6 @@ def save_state(state: Dict) -> None:
 
 
 def should_post(state: Dict, key: str, stamp: str) -> bool:
-    """Simple dedupe: post only if last_stamp != stamp"""
     last = state.get(key)
     return last != stamp
 
@@ -153,9 +151,6 @@ def fetch_ics(url: str, timeout_s: int = 30) -> str:
 
 
 def _unfold_ics_lines(ics_text: str) -> List[str]:
-    """
-    RFC5545 line folding: lines starting with space/tab continue previous line.
-    """
     raw = ics_text.splitlines()
     out = []
     for line in raw:
@@ -173,12 +168,6 @@ def _unfold_ics_lines(ics_text: str) -> List[str]:
 
 
 def _parse_dt(value: str, tzid: Optional[str]) -> dt.datetime:
-    """
-    Handles:
-      - YYYYMMDDTHHMMSSZ (UTC)
-      - YYYYMMDDTHHMMSS (local, interpret as tzid if provided, else Kyiv)
-      - YYYYMMDD (all-day) -> treat as 00:00 in tzid/Kyiv
-    """
     value = value.strip()
     if re.fullmatch(r"\d{8}", value):
         d = dt.datetime.strptime(value, "%Y%m%d").date()
@@ -269,7 +258,6 @@ def parse_ics_events(ics_text: str) -> List[Event]:
 
 
 def events_in_range(events: List[Event], start_date: dt.date, end_date: dt.date) -> List[Event]:
-    """inclusive date-range by start date in Kyiv time."""
     out = []
     for ev in events:
         d = ev.start.astimezone(KYIV_TZ).date()
@@ -356,14 +344,6 @@ def extract_teacher(description: str) -> Optional[str]:
 
 
 def extract_passcode(text: str) -> Optional[str]:
-    """
-    Matches:
-      - "Код: Kuk-2025"
-      - "Код доступу: Kuk-2026"
-      - "Код доступа: Kuk-2026"
-      - "Passcode: BdF5kn"
-      - "Пароль: 12345"
-    """
     if not text:
         return None
     t = text.replace("\\n", "\n")
@@ -515,9 +495,7 @@ def format_day(events: List[Event], day: dt.date) -> str:
         discipline, etype = split_summary(ev.summary)
         teacher = extract_teacher(ev.description)
 
-        # passcode can be in description/location/summary
         passcode = extract_passcode(ev.description + "\n" + ev.location + "\n" + ev.summary)
-
         place = classify_place(ev.location, ev.description)
 
         links = extract_zoom_links(ev.description + "\n" + ev.location)
@@ -531,11 +509,10 @@ def format_day(events: List[Event], day: dt.date) -> str:
         lines.append(f"🕒 <b>{pfx}{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
         lines.append(f"📚 <b>{escape_html(discipline)}</b>")
 
-        # Moodle button/link (independent of lecture/practice)
+        # Moodle: ONLY button (no raw URL)
         if moodle_url:
             href_m = escape_html_attr(moodle_url)
             lines.append(f'📘 <a href="{href_m}">Відкрити Moodle</a>')
-            lines.append(f"📎 <code>{escape_html(moodle_url)}</code>")
 
         if etype:
             lines.append(f"🎓 {etype}")
