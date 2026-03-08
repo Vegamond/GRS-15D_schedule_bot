@@ -48,7 +48,7 @@ MOODLE_LINKS = {
     "Туристичне країнознавство": "https://distance.kuk.edu.ua/course/view.php?id=8560",
     "Готельна справа": "https://distance.kuk.edu.ua/course/view.php?id=8064",
     "Історія України": "https://distance.kuk.edu.ua/mod/attendance/view.php?id=175144",
-    # "Ділова українська мова": "",  # додаси коли буде
+    "Ділова українська мова": "https://distance.kuk.edu.ua/mod/attendance/view.php?id=113738",
     "Культурні та креативні індустрії": "https://distance.kuk.edu.ua/course/view.php?id=2067",
     "Барна справа": "https://distance.kuk.edu.ua/course/view.php?id=5472",
     "Ресторанна справа": "https://distance.kuk.edu.ua/course/view.php?id=8561",
@@ -139,6 +139,18 @@ def env_optional_int(name: str) -> Optional[int]:
         return int(v)
     except ValueError:
         return None
+
+
+# ----------------------------
+# Posting policy by weekday
+# Monday=0 ... Sunday=6
+# ----------------------------
+def is_saturday(day: dt.date) -> bool:
+    return day.weekday() == 5
+
+
+def is_sunday(day: dt.date) -> bool:
+    return day.weekday() == 6
 
 
 # ----------------------------
@@ -509,7 +521,7 @@ def format_day(events: List[Event], day: dt.date) -> str:
         lines.append(f"🕒 <b>{pfx}{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
         lines.append(f"📚 <b>{escape_html(discipline)}</b>")
 
-        # Moodle: ONLY button (no raw URL)
+        # Moodle: only functional button
         if moodle_url:
             href_m = escape_html_attr(moodle_url)
             lines.append(f'📘 <a href="{href_m}">Відкрити Moodle</a>')
@@ -520,11 +532,12 @@ def format_day(events: List[Event], day: dt.date) -> str:
             lines.append(f"👩‍🏫 {escape_html(teacher)}")
         lines.append(escape_html(place))
 
+        # Zoom: only functional button
         if link:
             href = escape_html_attr(link)
             lines.append(f'🔗 <a href="{href}">Відкрити Zoom</a>')
-            lines.append(f"📎 <code>{escape_html(link)}</code>")
 
+        # Leave only passcode for easy copying
         if passcode:
             lines.append("🔑 Код доступу:")
             lines.append(f"📎 <code>{escape_html(passcode)}</code>")
@@ -606,6 +619,12 @@ def main():
     today = now_kyiv().date()
 
     if args.mode == "today":
+        # Saturday: no posts
+        # Sunday: no "today" post
+        if is_saturday(today) or is_sunday(today):
+            print("Skipping 'today': no today-posts on Saturday or Sunday.")
+            return
+
         target = today
         stamp = f"today:{iso_date(target)}"
         if not should_post(state, "last_today", stamp):
@@ -627,6 +646,12 @@ def main():
         print("Posted today schedule.")
 
     elif args.mode == "tomorrow":
+        # Saturday: no posts
+        # Sunday evening "tomorrow" is allowed
+        if is_saturday(today):
+            print("Skipping 'tomorrow': no posts on Saturday.")
+            return
+
         target = today + dt.timedelta(days=1)
         stamp = f"tomorrow:{iso_date(target)}"
         if not should_post(state, "last_tomorrow", stamp):
@@ -648,7 +673,11 @@ def main():
         print("Posted tomorrow schedule.")
 
     elif args.mode == "week":
-        # ✅ NEXT WEEK (Mon–Sun)
+        # Weekly post is intended for Sunday run
+        if not is_sunday(today):
+            print("Skipping 'week': weekly post should run on Sunday only.")
+            return
+
         this_monday = today - dt.timedelta(days=today.weekday())  # Monday=0
         next_monday = this_monday + dt.timedelta(days=7)
         next_sunday = next_monday + dt.timedelta(days=6)
