@@ -53,6 +53,7 @@ MOODLE_LINKS = {
     "Барна справа": "https://distance.kuk.edu.ua/course/view.php?id=5472",
     "Ресторанна справа": "https://distance.kuk.edu.ua/course/view.php?id=8561",
     "Емоційний інтелект": "https://distance.kuk.edu.ua/mod/attendance/view.php?id=166795",
+    "Товарознавство": "https://distance.kuk.edu.ua/mod/attendance/view.php?id=137551",
 }
 
 
