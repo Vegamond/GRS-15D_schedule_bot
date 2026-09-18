@@ -5,7 +5,7 @@ on:
     # 07:00 Kyiv = 04:00 UTC while summer time (EEST, UTC+3) is in effect.
     # DST ends 2026-10-25 — after that, Kyiv is UTC+2 (EET), so switch this
     # to "0 5 * * *" (05:00 UTC = 07:00 Kyiv in winter).
-    - cron: "0 4 * * *"
+    - cron: "0 3 * * *"
   workflow_dispatch:
 
 permissions:
