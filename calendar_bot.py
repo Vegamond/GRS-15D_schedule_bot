@@ -18,7 +18,12 @@ TG_MAX_LEN = 4096
 
 # Банка «На каву адміну ☕» — рядок додається лише в недільний тижневий пост
 DONATE_URL = "https://send.monobank.ua/jar/2rWrXwkk7H"
-DONATE_LINE = f'☕ Якщо розклад тобі допомагає, можна <a href="{DONATE_URL}">пригостити адміна кавою</a>'
+DONATE_LINE = (
+    "<blockquote>"
+    "☕ <b>Розклад тобі допомагає?</b>\n"
+    f'💛 <b><u><a href="{DONATE_URL}">ДОНАТ НА КАВУ АДМІНУ</a></u></b> 👈'
+    "</blockquote>"
+)
 
 
 def tg_visible_len(html_text: str) -> int:
