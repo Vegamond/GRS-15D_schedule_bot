@@ -19,6 +19,14 @@ TG_MAX_LEN = 4096
 # Банка «На каву адміну ☕» — рядок додається лише в недільний тижневий пост
 DONATE_URL = "https://send.monobank.ua/jar/2rWrXwkk7H"
 DONATE_LINE = f'☕ Якщо розклад тобі допомагає, можна <a href="{DONATE_URL}">пригостити адміна кавою</a>'
+
+
+def tg_visible_len(html_text: str) -> int:
+    """Довжина так, як її рахує Telegram: без HTML-тегів, сутності як 1 символ,
+    у UTF-16 code units (емодзі = 2)."""
+    import html as _html
+    plain = _html.unescape(re.sub(r"<[^>]+>", "", html_text))
+    return len(plain.encode("utf-16-le")) // 2
  
 URL_RE = re.compile(
     r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+",
@@ -515,7 +523,7 @@ def format_week_message(events: List[Event], start_day: dt.date, end_day: dt.dat
     msg = header + "\n".join(blocks) + f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
     # Рядок про банку — лише якщо пост не впирається в ліміт Telegram
     donate = f"\n\n{DONATE_LINE}"
-    if len(msg) + len(donate) <= TG_MAX_LEN:
+    if tg_visible_len(msg + donate) <= TG_MAX_LEN:
         msg += donate
     return msg
  
