@@ -14,6 +14,11 @@ import requests
  
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = "state.json"
+TG_MAX_LEN = 4096
+
+# Банка «На каву адміну ☕» — рядок додається лише в недільний тижневий пост
+DONATE_URL = "https://send.monobank.ua/jar/2rWrXwkk7H"
+DONATE_LINE = f'☕ Якщо розклад тобі допомагає, можна <a href="{DONATE_URL}">пригостити адміна кавою</a>'
  
 URL_RE = re.compile(
     r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+",
@@ -507,7 +512,12 @@ def format_week_message(events: List[Event], start_day: dt.date, end_day: dt.dat
         blocks.append(separator())
         blocks.append(format_day(by_day[d], d))
     blocks.append(separator())
-    return header + "\n".join(blocks) + f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
+    msg = header + "\n".join(blocks) + f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
+    # Рядок про банку — лише якщо пост не впирається в ліміт Telegram
+    donate = f"\n\n{DONATE_LINE}"
+    if len(msg) + len(donate) <= TG_MAX_LEN:
+        msg += donate
+    return msg
  
  
 def tg_send_message(
