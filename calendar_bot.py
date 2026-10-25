@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
- 
+
 import os
 import re
+import html
 import json
 import argparse
 import datetime as dt
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
+from urllib.parse import urlparse, parse_qs
 from zoneinfo import ZoneInfo
- 
+
 import requests
- 
+
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = "state.json"
 TG_MAX_LEN = 4096
@@ -32,12 +34,13 @@ def tg_visible_len(html_text: str) -> int:
     import html as _html
     plain = _html.unescape(re.sub(r"<[^>]+>", "", html_text))
     return len(plain.encode("utf-16-le")) // 2
- 
+
+
 URL_RE = re.compile(
     r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+",
     re.IGNORECASE
 )
- 
+
 PAIR_BY_START = {
     "09:00": 1,
     "10:40": 2,
@@ -45,14 +48,15 @@ PAIR_BY_START = {
     "14:10": 4,
     "15:40": 5,
 }
- 
- 
+
+
 def pair_no(t: dt.datetime) -> Optional[int]:
     s = t.astimezone(KYIV_TZ).strftime("%H:%M")
     return PAIR_BY_START.get(s)
- 
- 
+
+
 MOODLE_LINKS = {
+    # Посилання на Moodle з опису події має пріоритет над цим словником.
     "Туристичне країнознавство": "https://distance.kuk.edu.ua/course/view.php?id=8560",
     "Готельна справа": "https://distance.kuk.edu.ua/course/view.php?id=8064",
     "Історія України": "https://distance.kuk.edu.ua/mod/attendance/view.php?id=175144",
@@ -63,15 +67,19 @@ MOODLE_LINKS = {
     "Емоційний інтелект": "https://distance.kuk.edu.ua/mod/attendance/view.php?id=166795",
     "Товарознавство": "https://distance.kuk.edu.ua/mod/attendance/view.php?id=137551",
 }
- 
- 
+
+
 def normalize_discipline(name: str) -> str:
-    return " ".join((name or "").replace("\u2019", "'").split()).casefold()
- 
- 
-MOODLE_LINKS_NORM = {normalize_discipline(k): v for k, v in MOODLE_LINKS.items() if v}
- 
- 
+    return " ".join((name or "").replace("’", "'").split()).casefold()
+
+
+MOODLE_LINKS_NORM = {
+    normalize_discipline(k): v
+    for k, v in MOODLE_LINKS.items()
+    if v
+}
+
+
 def ics_unescape(s: str) -> str:
     if not s:
         return ""
@@ -81,8 +89,21 @@ def ics_unescape(s: str) -> str:
             .replace(r"\,", ",")
             .replace(r"\;", ";")
             .replace(r"\\", "\\"))
- 
- 
+
+
+def html_to_text(s: str) -> str:
+    """Google Calendar зберігає опис, набраний у своєму редакторі, як HTML
+    (<br>, <a href>, <b> ...). Повертаємо звичайні рядки, щоб «Код:» і «Викл.:»
+    знаходились на початку рядка, а посилання бралось зі справжнього href."""
+    if not s or "<" not in s:
+        return s
+    s = re.sub(r'<a\s[^>]*href="([^"]+)"[^>]*>.*?</a>', r' \1 ', s, flags=re.I | re.S)
+    s = re.sub(r'<br\s*/?>|</p>|</div>|</li>', '\n', s, flags=re.I)
+    s = re.sub(r'<[^>]+>', '', s)
+    s = html.unescape(s).replace('\u00a0', ' ')
+    return "\n".join(line.strip() for line in s.splitlines())
+
+
 @dataclass
 class Event:
     start: dt.datetime
@@ -90,16 +111,16 @@ class Event:
     summary: str
     description: str
     location: str
- 
- 
+
+
 def now_kyiv() -> dt.datetime:
     return dt.datetime.now(tz=KYIV_TZ)
- 
- 
+
+
 def iso_date(d: dt.date) -> str:
     return d.isoformat()
- 
- 
+
+
 def load_state() -> Dict:
     if not os.path.exists(STATE_FILE):
         return {}
@@ -108,29 +129,29 @@ def load_state() -> Dict:
             return json.load(f)
     except Exception:
         return {}
- 
- 
+
+
 def save_state(state: Dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
- 
- 
+
+
 def should_post(state: Dict, key: str, stamp: str) -> bool:
     last = state.get(key)
     return last != stamp
- 
- 
+
+
 def mark_posted(state: Dict, key: str, stamp: str) -> None:
     state[key] = stamp
- 
- 
+
+
 def env_required(name: str) -> str:
     val = os.getenv(name, "").strip()
     if not val:
         raise RuntimeError(f"Missing required env var: {name}")
     return val
- 
- 
+
+
 def env_optional_int(name: str) -> Optional[int]:
     v = os.getenv(name, "").strip()
     if not v:
@@ -139,22 +160,22 @@ def env_optional_int(name: str) -> Optional[int]:
         return int(v)
     except ValueError:
         return None
- 
- 
+
+
 def is_saturday(day: dt.date) -> bool:
     return day.weekday() == 5
- 
- 
+
+
 def is_sunday(day: dt.date) -> bool:
     return day.weekday() == 6
- 
- 
+
+
 def fetch_ics(url: str, timeout_s: int = 30) -> str:
     resp = requests.get(url, timeout=timeout_s)
     resp.raise_for_status()
     return resp.text
- 
- 
+
+
 def _unfold_ics_lines(ics_text: str) -> List[str]:
     raw = ics_text.splitlines()
     out = []
@@ -170,8 +191,8 @@ def _unfold_ics_lines(ics_text: str) -> List[str]:
         else:
             out.append(line)
     return out
- 
- 
+
+
 def _parse_dt(value: str, tzid: Optional[str]) -> dt.datetime:
     value = value.strip()
     if re.fullmatch(r"\d{8}", value):
@@ -186,14 +207,14 @@ def _parse_dt(value: str, tzid: Optional[str]) -> dt.datetime:
     naive = dt.datetime.strptime(value, "%Y%m%dT%H%M%S")
     tz = ZoneInfo(tzid) if tzid else KYIV_TZ
     return naive.replace(tzinfo=tz).astimezone(KYIV_TZ)
- 
- 
+
+
 def parse_ics_events(ics_text: str) -> List[Event]:
     lines = _unfold_ics_lines(ics_text)
     events: List[Event] = []
     in_event = False
     cur: Dict[str, Tuple[Optional[str], str]] = {}
- 
+
     def flush():
         nonlocal cur
         if not cur:
@@ -209,12 +230,12 @@ def parse_ics_events(ics_text: str) -> List[Event]:
         start = _parse_dt(dtstart_val, dtstart_tz)
         end = _parse_dt(dtend_val, dtend_tz)
         summary = ics_unescape(summary_raw).strip()
-        description = ics_unescape(description_raw).strip()
-        location = ics_unescape(location_raw).strip()
+        description = html_to_text(ics_unescape(description_raw)).strip()
+        location = html_to_text(ics_unescape(location_raw)).strip()
         events.append(Event(start=start, end=end, summary=summary,
                             description=description, location=location))
         cur = {}
- 
+
     for line in lines:
         if line == "BEGIN:VEVENT":
             in_event = True
@@ -241,11 +262,11 @@ def parse_ics_events(ics_text: str) -> List[Event]:
         value = value.strip()
         if key in {"DTSTART", "DTEND", "SUMMARY", "DESCRIPTION", "LOCATION"}:
             cur[key] = (tzid, value)
- 
+
     events.sort(key=lambda e: e.start)
     return events
- 
- 
+
+
 def events_in_range(events: List[Event], start_date: dt.date, end_date: dt.date) -> List[Event]:
     out = []
     for ev in events:
@@ -253,83 +274,181 @@ def events_in_range(events: List[Event], start_date: dt.date, end_date: dt.date)
         if start_date <= d <= end_date:
             out.append(ev)
     return out
- 
- 
+
+
 UA_DOW = {
     0: "Понеділок", 1: "Вівторок", 2: "Середа",
-    3: "Четвер", 4: "П\u02bcятниця", 5: "Субота", 6: "Неділя",
+    3: "Четвер", 4: "Пʼятниця", 5: "Субота", 6: "Неділя",
 }
- 
-TYPE_WORDS = {
-    "лекція": "Лекція",
-    "практич": "Практичне",
-    "лаб": "Лабораторна",
-    "семінар": "Семінар",
-    "гостьова лекція": "Гостьова Лекція",
-    "консультація": "Консультація",
-    "залік": "Залік",
-    "іспит": "Іспит",
-    "екзамен": "Екзамен",
-}
- 
-# Типи що відображаються як виділений блок з рамкою
+
+RKR_TYPE = "Ректорська контрольна робота"
+
+
+def detect_type(tail: str) -> Optional[str]:
+    t = tail.strip().lower()
+    # РКР перевіряємо першою — «контрольна» не повинна потрапити в інші типи
+    if "ректор" in t or re.search(r"\bркр\b", t):
+        return RKR_TYPE
+    if "гостьова" in t:
+        return "Гостьова Лекція"
+    if "лекц" in t:
+        return "Лекція"
+    if "практ" in t or t == "пр." or t == "пр":
+        return "Практичне"
+    if "лаб" in t:
+        return "Лабораторна"
+    if "семінар" in t:
+        return "Семінар"
+    if "консультація" in t:
+        return "Консультація"
+    if "іспит" in t:
+        return "Іспит"
+    if "залік" in t:
+        return "Залік"
+    if "екзамен" in t:
+        return "Екзамен"
+    return None
+
+
+# Заліки/іспити — виділений блок без номера пари
 EXAM_TYPES = {"Залік", "Іспит", "Екзамен"}
- 
- 
+# Усі типи, що показуються виділеним блоком з рамкою і йдуть першими
+HIGHLIGHT_TYPES = EXAM_TYPES | {RKR_TYPE}
+
+
 def split_summary(summary: str) -> Tuple[str, Optional[str]]:
     s = summary.strip()
-    parts = [p.strip() for p in s.split("—")]
-    if len(parts) >= 2:
-        tail = parts[-1].lower()
-        for k, v in TYPE_WORDS.items():
-            if k in tail:
-                return ("—".join(parts[:-1]).strip(), v)
-    parts2 = [p.strip() for p in s.split("-")]
-    if len(parts2) >= 2:
-        tail = parts2[-1].lower()
-        for k, v in TYPE_WORDS.items():
-            if k in tail:
-                return ("-".join(parts2[:-1]).strip(), v)
-    return (s, None)
- 
- 
-def _normalize_for_links(text: str) -> str:
+    if "—" in s:
+        left, right = s.rsplit("—", 1)
+        etype = detect_type(right)
+        if etype:
+            return left.strip(), etype
+    if " - " in s:
+        left, right = s.rsplit(" - ", 1)
+        etype = detect_type(right)
+        if etype:
+            return left.strip(), etype
+    # «Маркетинг-Лекція» без пробілів (як у старому форматі)
+    if "-" in s:
+        left, right = s.rsplit("-", 1)
+        etype = detect_type(right)
+        if etype:
+            return left.strip(), etype
+    m = re.match(r"^(.*?)\s*\(([^()]*)\)\s*$", s)
+    if m:
+        base = m.group(1).strip()
+        tail = m.group(2).strip()
+        etype = detect_type(tail)
+        if etype:
+            return base, etype
+    return s, None
+
+
+# ───────────────────────── Посилання ─────────────────────────
+
+MEETING_KINDS = ("zoom", "meet", "teams")
+MEETING_NAMES = {"zoom": "Zoom", "meet": "Google Meet", "teams": "Teams"}
+LINK_LABELS = {
+    "zoom": "🔗 <a href=\"{u}\">Відкрити Zoom</a>",
+    "meet": "🔗 <a href=\"{u}\">Відкрити Google Meet</a>",
+    "teams": "🔗 <a href=\"{u}\">Відкрити Teams</a>",
+    "moodle": "📘 <a href=\"{u}\">Відкрити Moodle</a>",
+    "other": "🔗 <a href=\"{u}\">Посилання</a>",
+}
+
+
+def _unwrap_google_redirect(url: str) -> str:
+    """Google Calendar іноді обгортає посилання в google.com/url?q=..."""
+    try:
+        p = urlparse(url)
+        if p.netloc.endswith("google.com") and p.path == "/url":
+            qs = parse_qs(p.query)
+            target = (qs.get("q") or qs.get("url") or [None])[0]
+            if target and target.startswith("http"):
+                return target
+    except Exception:
+        pass
+    return url
+
+
+def _clean_url(url: str) -> str:
+    url = url.rstrip(".,;:!?)]}»\"'")
+    return _unwrap_google_redirect(url)
+
+
+def classify_link(url: str) -> str:
+    u = url.lower()
+    if "zoom.us" in u:
+        return "zoom"
+    if "meet.google.com" in u:
+        return "meet"
+    if "teams.microsoft" in u or "teams.live" in u:
+        return "teams"
+    if "moodle" in u or "distance.kuk.edu.ua" in u:
+        return "moodle"
+    return "other"
+
+
+def extract_links(text: str) -> List[Tuple[str, str]]:
+    """Усі посилання з тексту як [(тип, url)], без дублів, у порядку появи."""
     if not text:
-        return ""
-    t = text.replace("\\n", "\n")
-    t = t.replace("\u200b", "")
-    return t
- 
- 
-def extract_zoom_links(text: str) -> List[str]:
-    t = _normalize_for_links(text)
-    links = URL_RE.findall(t)
-    zoom = [l for l in links if "zoom.us" in l.lower()]
-    rest = [l for l in links if l not in zoom]
-    return zoom + rest
- 
- 
+        return []
+    t = text.replace("\\n", "\n").replace("\u200b", "")
+    out: List[Tuple[str, str]] = []
+    seen = set()
+    for raw in URL_RE.findall(t):
+        u = _clean_url(raw)
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append((classify_link(u), u))
+    return out
+
+
+# ───────────────────────── Викладач ─────────────────────────
+
+# Префікси: довші форми стоять першими, а lookahead не дає «викл»
+# зачепити початок слова «викладач».
+TEACHER_PREFIX_RE = re.compile(
+    r"^(?:ст\.?\s*викл\.?|старший\s+викладач|викладач|викл\.?|доцент|доц\.?|"
+    r"професор|проф\.?|асистент|асист\.?|лектор|піб)"
+    r"(?![а-яіїєґʼ'’])\s*[:\-–—]?\s*(.+)$",
+    re.IGNORECASE,
+)
+
+_NAME_WORD = r"[А-ЯІЇЄҐ][а-яіїєґʼ'’\-]+"
+_INITIALS = r"[А-ЯІЇЄҐ]\.\s?[А-ЯІЇЄҐ]\.?"
+# Рядок, що складається лише з ПІБ:
+#   «Іваненко І.П.», «І.П. Іваненко», «Іваненко Ірина Петрівна»
+PIB_RE = re.compile(
+    rf"^(?:{_NAME_WORD}\s+{_INITIALS}|{_INITIALS}\s+{_NAME_WORD}|"
+    rf"{_NAME_WORD}(?:\s+{_NAME_WORD}){{2}})$"
+)
+
+
 def extract_teacher(description: str) -> Optional[str]:
     if not description:
         return None
     lines = [l.strip() for l in description.splitlines() if l.strip()]
-    patterns = [
-        r"^(?:доц\.?|доцент)\s*[:\-]?\s*(.+)$",
-        r"^(?:викл\.?|викладач)\s*[:\-]?\s*(.+)$",
-        r"^(?:проф\.?|професор)\s*[:\-]?\s*(.+)$",
-        r"^(?:асист\.?|асистент)\s*[:\-]?\s*(.+)$",
-        r"^(?:Доц\.?|Доцент)\s*[:\-]?\s*(.+)$",
-        r"^(?:Викл\.?|Викладач)\s*[:\-]?\s*(.+)$",
-        r"^(?:Проф\.?|Професор)\s*[:\-]?\s*(.+)$",
-    ]
+
+    # 1) Явний префікс: «Викладач: ...», «доц. ...», «ПІБ: ...»
     for line in lines:
-        for pat in patterns:
-            m = re.match(pat, line, flags=re.IGNORECASE)
-            if m:
-                return m.group(1).strip()
+        m = TEACHER_PREFIX_RE.match(line)
+        if m:
+            val = URL_RE.sub("", m.group(1)).strip(" ,;:-–—")
+            if val:
+                return val
+
+    # 2) Рядок, який сам по собі є ПІБ (без префікса)
+    for line in lines:
+        if URL_RE.search(line) or re.search(r"\d", line):
+            continue
+        cand = line.strip(" ,;")
+        if PIB_RE.match(cand):
+            return cand
     return None
- 
- 
+
+
 def extract_passcode(text: str) -> Optional[str]:
     if not text:
         return None
@@ -343,23 +462,34 @@ def extract_passcode(text: str) -> Optional[str]:
         if m:
             return m.group(1).strip()
     return None
- 
- 
-def classify_place(location: str, description: str) -> str:
+
+
+AUD_RE = re.compile(r"ауд\.?\s*(\d+)", re.IGNORECASE)
+
+
+def fmt_aud(m: "re.Match") -> str:
+    return f"ауд. {m.group(1)}"
+
+
+def classify_place(location: str, description: str,
+                   meeting_kind: Optional[str] = None) -> str:
     blob = f"{location}\n{description}".lower()
-    if "online" in blob or "zoom" in blob:
-        m = re.search(r"(ауд\.?\s*\d+)", blob, flags=re.IGNORECASE)
-        if m:
-            return f"🌐 Online (Zoom) • 🏫 {m.group(1).replace('ауд', 'ауд.').strip()}"
-        return "🌐 Online (Zoom)"
-    m2 = re.search(r"(ауд\.?\s*\d+)", blob, flags=re.IGNORECASE)
-    if m2:
-        return f"🏫 {m2.group(1).replace('ауд', 'ауд.').strip()}"
-    if location.strip():
-        return f"📍 {location.strip()}"
+    aud = AUD_RE.search(blob)
+    online = bool(meeting_kind) or "online" in blob or "онлайн" in blob or "zoom" in blob
+    if online:
+        name = MEETING_NAMES.get(meeting_kind) or ("Zoom" if "zoom" in blob else None)
+        label = f"🌐 Online ({name})" if name else "🌐 Online"
+        if aud:
+            return f"{label} • 🏫 {fmt_aud(aud)}"
+        return label
+    if aud:
+        return f"🏫 {fmt_aud(aud)}"
+    loc = URL_RE.sub("", location).strip(" ,;\n")
+    if loc:
+        return f"📍 {loc}"
     return "📍 (місце не вказано)"
- 
- 
+
+
 def get_weather_dnipro(day: dt.date) -> Optional[Dict]:
     lat, lon = 48.45, 34.98
     url = (
@@ -390,8 +520,8 @@ def get_weather_dnipro(day: dt.date) -> Optional[Dict]:
         }
     except Exception:
         return None
- 
- 
+
+
 def weathercode_ua(code: int) -> str:
     mapping = {
         0: "ясно", 1: "переважно ясно", 2: "мінлива хмарність", 3: "хмарно",
@@ -404,119 +534,140 @@ def weathercode_ua(code: int) -> str:
         85: "снігопад", 86: "сильний снігопад",
         95: "гроза", 96: "гроза з градом", 99: "гроза з градом",
     }
-    return mapping.get(code, "погода (код: %s)" % code)
- 
- 
+    return mapping.get(code, f"погода (код: {code})")
+
+
 def format_weather_block(day: dt.date, label: str) -> str:
     w = get_weather_dnipro(day)
     if not w:
         return ""
-    lines = []
-    lines.append(f"⛅ Погода в Дніпрі на {label}:")
-    lines.append(f"• {w['desc']}")
-    lines.append(f"• 🌡️ Мін/Макс: {w['tmin']}°C / {w['tmax']}°C")
+    lines = [
+        f"⛅ Погода в Дніпрі на {label}:",
+        f"• {w['desc']}",
+        f"• 🌡️ Мін/Макс: {w['tmin']}°C / {w['tmax']}°C",
+    ]
     if w.get("p") is not None:
         lines.append(f"• ☔ Ймовірність опадів: {w['p']}%")
     return "\n".join(lines) + "\n\n"
- 
- 
+
+
 def hhmm(t: dt.datetime) -> str:
     return t.astimezone(KYIV_TZ).strftime("%H:%M")
- 
- 
+
+
 def fmt_date_short(d: dt.date) -> str:
     return d.strftime("%d.%m")
- 
- 
+
+
 def day_header(d: dt.date) -> str:
     dow = UA_DOW[d.weekday()]
     return f"📅 <b>{dow}</b> • <b>{fmt_date_short(d)}</b>"
- 
- 
+
+
 def separator() -> str:
     return "━━━━━━━━━━━━━━━━━━━━"
- 
- 
+
+
 def escape_html(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
- 
- 
+
+
 def escape_html_attr(s: str) -> str:
     return escape_html(s).replace('"', "&quot;")
- 
- 
+
+
+def link_line(kind: str, url: str) -> str:
+    return LINK_LABELS[kind].format(u=escape_html_attr(url))
+
+
 def format_day(events: List[Event], day: dt.date) -> str:
     lines = []
     lines.append(day_header(day))
     lines.append("")
- 
+
     if not events:
         lines.append("— (пар немає)")
         return "\n".join(lines)
- 
-    # Заліки/іспити завжди першими, потім решта пар за часом
-    exams = [ev for ev in events if split_summary(ev.summary)[1] in EXAM_TYPES]
-    pairs = [ev for ev in events if split_summary(ev.summary)[1] not in EXAM_TYPES]
-    sorted_events = exams + pairs
- 
+
+    # Заліки/іспити/РКР завжди першими, потім решта пар за часом
+    top = [ev for ev in events if split_summary(ev.summary)[1] in HIGHLIGHT_TYPES]
+    rest = [ev for ev in events if split_summary(ev.summary)[1] not in HIGHLIGHT_TYPES]
+    sorted_events = top + rest
+
     for ev in sorted_events:
         discipline, etype = split_summary(ev.summary)
+        text_blob = ev.description + "\n" + ev.location
         teacher = extract_teacher(ev.description)
-        passcode = extract_passcode(ev.description + "\n" + ev.location + "\n" + ev.summary)
-        place = classify_place(ev.location, ev.description)
-        links = extract_zoom_links(ev.description + "\n" + ev.location)
-        link = links[0] if links else None
-        moodle_url = MOODLE_LINKS_NORM.get(normalize_discipline(discipline))
+        passcode = extract_passcode(text_blob + "\n" + ev.summary)
+        links = extract_links(text_blob)
+
+        meeting = next(((k, u) for k, u in links if k in MEETING_KINDS), None)
+        moodle_url = (next((u for k, u in links if k == "moodle"), None)
+                      or MOODLE_LINKS_NORM.get(normalize_discipline(discipline)))
+        other_links = [u for k, u in links if k == "other"][:2]
+
         is_exam = etype in EXAM_TYPES
- 
-        if is_exam:
-            # Залік/Іспит — виділений блок з рамкою, без номера пари
+        is_rkr = etype == RKR_TYPE
+        highlighted = is_exam or is_rkr
+
+        if highlighted:
             lines.append(separator())
-            lines.append(f"📝 <b>{etype.upper()}!</b>")
-            lines.append(f"🕒 <b>{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
+            icon = "🛑" if is_rkr else "📝"
+            lines.append(f"{icon} <b>{etype.upper()}!</b>")
+            if is_rkr:
+                pno = pair_no(ev.start)
+                pfx = f"{pno} пара " if pno else ""
+                lines.append(f"🕒 <b>{pfx}{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
+            else:
+                lines.append(f"🕒 <b>{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
         else:
             pno = pair_no(ev.start)
             pfx = f"{pno} пара " if pno else ""
             lines.append(f"🕒 <b>{pfx}{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
- 
+
         lines.append(f"📚 <b>{escape_html(discipline)}</b>")
- 
+
         if moodle_url:
-            href_m = escape_html_attr(moodle_url)
-            lines.append(f'📘 <a href="{href_m}">Відкрити Moodle</a>')
- 
-        if etype and not is_exam:
+            lines.append(link_line("moodle", moodle_url))
+
+        if etype and not highlighted:
             lines.append(f"🎓 {etype}")
+
         if teacher:
             lines.append(f"👩\u200d🏫 {escape_html(teacher)}")
-        lines.append(escape_html(place))
- 
-        if link:
-            href = escape_html_attr(link)
-            lines.append(f'🔗 <a href="{href}">Відкрити Zoom</a>')
- 
+
+        place = classify_place(ev.location, ev.description,
+                               meeting[0] if meeting else None)
+        # Якщо є лише Moodle і більше нічого — «місце не вказано» не пишемо
+        if not (moodle_url and place == "📍 (місце не вказано)"):
+            lines.append(escape_html(place))
+        if meeting:
+            lines.append(link_line(meeting[0], meeting[1]))
+        for u in other_links:
+            lines.append(link_line("other", u))
         if passcode:
             lines.append("🔑 Код доступу:")
             lines.append(f"📎 <code>{escape_html(passcode)}</code>")
- 
-        if is_exam:
+
+        if highlighted:
             lines.append(separator())
- 
+
         lines.append("")
- 
+
     while lines and lines[-1] == "":
         lines.pop()
- 
+
     return "\n".join(lines)
- 
- 
+
+
 def format_week_message(events: List[Event], start_day: dt.date, end_day: dt.date) -> str:
     header = (
         f"🗓️ <b>Розклад на тиждень</b>\n"
         f"<b>{fmt_date_short(start_day)} – {fmt_date_short(end_day)}</b>\n\n"
     )
     by_day: Dict[dt.date, List[Event]] = {
-        start_day + dt.timedelta(days=i): [] for i in range((end_day - start_day).days + 1)
+        start_day + dt.timedelta(days=i): []
+        for i in range((end_day - start_day).days + 1)
     }
     for ev in events:
         by_day[ev.start.astimezone(KYIV_TZ).date()].append(ev)
@@ -531,8 +682,8 @@ def format_week_message(events: List[Event], start_day: dt.date, end_day: dt.dat
     if tg_visible_len(msg + donate) <= TG_MAX_LEN:
         msg += donate
     return msg
- 
- 
+
+
 def tg_send_message(
     token: str,
     chat_id: str,
@@ -553,23 +704,23 @@ def tg_send_message(
     data = r.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegram error: {data}")
- 
- 
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=["today", "tomorrow", "week"], help="Posting mode")
     args = parser.parse_args()
- 
+
     token = env_required("TG_BOT_TOKEN")
     chat_id = env_required("TG_CHAT_ID")
     ics_url = env_required("GCAL_ICS_URL")
     schedule_thread_id = env_optional_int("TG_SCHEDULE_THREAD_ID")
- 
+
     state = load_state()
     ics = fetch_ics(ics_url)
     all_events = parse_ics_events(ics)
     today = now_kyiv().date()
- 
+
     if args.mode == "today":
         if is_saturday(today) or is_sunday(today):
             print("Skipping 'today': no today-posts on Saturday or Sunday.")
@@ -589,7 +740,7 @@ def main():
         mark_posted(state, "last_today", stamp)
         save_state(state)
         print("Posted today schedule.")
- 
+
     elif args.mode == "tomorrow":
         if is_saturday(today):
             print("Skipping 'tomorrow': no posts on Saturday.")
@@ -609,7 +760,7 @@ def main():
         mark_posted(state, "last_tomorrow", stamp)
         save_state(state)
         print("Posted tomorrow schedule.")
- 
+
     elif args.mode == "week":
         if not is_sunday(today):
             print("Skipping 'week': weekly post should run on Sunday only.")
@@ -629,7 +780,7 @@ def main():
         mark_posted(state, "last_week", stamp)
         save_state(state)
         print("Posted weekly schedule (next week).")
- 
- 
+
+
 if __name__ == "__main__":
     main()
