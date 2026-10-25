@@ -702,8 +702,10 @@ def format_event(ev: Event, with_links: bool = True) -> List[str]:
     else:
         lines.append(nb(f"🕒 <b>{time_txt}</b>"))
 
-    # 2) Дисципліна
+    # 2) Дисципліна, під нею — її курс у Moodle (подалі від Zoom)
     lines.append(f"📚 <b>{escape_html(discipline)}</b>")
+    if with_links and moodle_url:
+        lines.append(nb(link_html("moodle", moodle_url)))
 
     # 3) Тип · місце
     place = short_place(ev.location, ev.description, meeting[0] if meeting else None)
@@ -726,14 +728,12 @@ def format_event(ev: Event, with_links: bool = True) -> List[str]:
     if teacher:
         lines.append(nb(f"👩‍🏫 {escape_html(teacher)}"))
 
-    # 5) Посилання — жирні, кожне на своєму рядку
+    # 5) Zoom/Meet і інші посилання — внизу, над кодом
     tools = []
     if not with_links:
         moodle_url_txt, meeting_txt, other_txt = None, None, []
     else:
         moodle_url_txt, meeting_txt, other_txt = moodle_url, meeting, other_links
-    if moodle_url_txt:
-        tools.append(nb(link_html("moodle", moodle_url_txt)))
     if meeting_txt:
         tools.append(nb(link_html(meeting_txt[0], meeting_txt[1])))
     for u in other_txt:
