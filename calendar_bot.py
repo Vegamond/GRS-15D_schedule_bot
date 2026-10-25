@@ -496,64 +496,104 @@ def classify_place(location: str, description: str,
     return "📍 (місце не вказано)"
 
 
+MORNING_HOUR = 8  # о котрій студенти виходять з дому — під цю годину і температура
+
+
 def get_weather_dnipro(day: dt.date) -> Optional[Dict]:
     lat, lon = 48.45, 34.98
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
-        "&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+        "&daily=weathercode,temperature_2m_max,temperature_2m_min,"
+        "precipitation_probability_max,wind_speed_10m_max"
+        "&hourly=temperature_2m"
+        "&wind_speed_unit=ms"
         "&timezone=Europe%2FKyiv"
     )
     try:
         r = requests.get(url, timeout=20)
         r.raise_for_status()
         data = r.json()
-        dates = data.get("daily", {}).get("time", [])
-        if not dates:
-            return None
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
         if day.isoformat() not in dates:
             return None
         idx = dates.index(day.isoformat())
-        wcode = data["daily"]["weathercode"][idx]
-        tmax = data["daily"]["temperature_2m_max"][idx]
-        tmin = data["daily"]["temperature_2m_min"][idx]
-        p = data["daily"]["precipitation_probability_max"][idx]
+
+        # Температура зранку (о MORNING_HOUR), якщо немає — нічний мінімум
+        tmorning = daily["temperature_2m_min"][idx]
+        hourly = data.get("hourly", {})
+        key = f"{day.isoformat()}T{MORNING_HOUR:02d}:00"
+        if key in hourly.get("time", []):
+            v = hourly["temperature_2m"][hourly["time"].index(key)]
+            if v is not None:
+                tmorning = v
+
+        p = daily.get("precipitation_probability_max", [None] * (idx + 1))[idx]
+        wind = daily.get("wind_speed_10m_max", [None] * (idx + 1))[idx]
         return {
-            "desc": weathercode_ua(wcode),
-            "tmin": int(round(tmin)),
-            "tmax": int(round(tmax)),
+            "code": daily["weathercode"][idx],
+            "tmorning": int(round(tmorning)),
+            "tmax": int(round(daily["temperature_2m_max"][idx])),
             "p": int(p) if p is not None else None,
+            "wind": float(wind) if wind is not None else None,
         }
     except Exception:
         return None
 
 
-def weathercode_ua(code: int) -> str:
+def weathercode_ua(code: int) -> Tuple[str, str]:
+    """(іконка, опис) за кодом WMO."""
     mapping = {
-        0: "ясно", 1: "переважно ясно", 2: "мінлива хмарність", 3: "хмарно",
-        45: "туман", 48: "паморозь / туман",
-        51: "мряка", 53: "мряка", 55: "мряка",
-        61: "дощ", 63: "дощ", 65: "сильний дощ",
-        66: "крижаний дощ", 67: "крижаний дощ",
-        71: "сніг", 73: "сніг", 75: "сильний сніг", 77: "снігова крупа",
-        80: "зливи", 81: "зливи", 82: "сильні зливи",
-        85: "снігопад", 86: "сильний снігопад",
-        95: "гроза", 96: "гроза з градом", 99: "гроза з градом",
+        0: ("☀️", "ясно"), 1: ("🌤️", "переважно ясно"), 2: ("⛅", "мінлива хмарність"),
+        3: ("☁️", "хмарно"),
+        45: ("🌫️", "туман"), 48: ("🌫️", "туман з памороззю"),
+        51: ("🌦️", "мряка"), 53: ("🌦️", "мряка"), 55: ("🌦️", "мряка"),
+        56: ("🌧️", "крижана мряка"), 57: ("🌧️", "крижана мряка"),
+        61: ("🌧️", "дощ"), 63: ("🌧️", "дощ"), 65: ("🌧️", "сильний дощ"),
+        66: ("🌧️", "крижаний дощ"), 67: ("🌧️", "крижаний дощ"),
+        71: ("🌨️", "сніг"), 73: ("🌨️", "сніг"), 75: ("❄️", "сильний сніг"),
+        77: ("🌨️", "снігова крупа"),
+        80: ("🌦️", "зливи"), 81: ("🌧️", "зливи"), 82: ("⛈️", "сильні зливи"),
+        85: ("🌨️", "снігопад"), 86: ("❄️", "сильний снігопад"),
+        95: ("⛈️", "гроза"), 96: ("⛈️", "гроза з градом"), 99: ("⛈️", "гроза з градом"),
     }
-    return mapping.get(code, f"погода (код: {code})")
+    return mapping.get(code, ("🌡️", "погода"))
+
+
+SNOW_CODES = {71, 73, 75, 77, 85, 86}
+ICE_CODES = {56, 57, 66, 67}
+
+
+def weather_hints(w: Dict) -> List[str]:
+    """Підказки — тільки коли вони справді потрібні (не більше двох)."""
+    hints = []
+    code = w["code"]
+    if code in ICE_CODES:
+        hints.append("🧊 Ожеледиця — обережно на дорогах")
+    elif code in SNOW_CODES:
+        hints.append("❄️ Сніг — обирай взуття, що не ковзає")
+    elif w.get("p") is not None and w["p"] >= 40:
+        hints.append(f"☔ Візьми парасольку — опади до {w['p']}%")
+    if w["tmorning"] <= 0:
+        hints.append("🧣 Зранку мороз — одягнися тепліше")
+    if w.get("wind") is not None and w["wind"] >= 10:
+        hints.append(f"💨 Сильний вітер — до {int(round(w['wind']))} м/с")
+    return hints[:2]
+
+
+def fmt_temp(t: int) -> str:
+    return f"+{t}°C" if t > 0 else f"{t}°C"
 
 
 def format_weather_block(day: dt.date, label: str) -> str:
     w = get_weather_dnipro(day)
     if not w:
         return ""
-    lines = [
-        f"⛅ Погода в Дніпрі на {label}:",
-        f"• {w['desc']}",
-        f"• 🌡️ Мін/Макс: {w['tmin']}°C / {w['tmax']}°C",
-    ]
-    if w.get("p") is not None:
-        lines.append(f"• ☔ Ймовірність опадів: {w['p']}%")
+    icon, desc = weathercode_ua(w["code"])
+    line = (f"{icon} <b>{label.capitalize()} в Дніпрі:</b> {desc} · "
+            f"зранку {fmt_temp(w['tmorning'])}, вдень до {fmt_temp(w['tmax'])}")
+    lines = [line] + weather_hints(w)
     return "\n".join(lines) + "\n\n"
 
 
