@@ -18,14 +18,16 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = "state.json"
 TG_MAX_LEN = 4096
 
-# Банка «На каву адміну ☕» — рядок додається лише в недільний тижневий пост
+# Банка «На каву адміну ☕» — окреме повідомлення з кнопкою після тижневого посту
 DONATE_URL = "https://send.monobank.ua/jar/2rWrXwkk7H"
 DONATE_LINE = (
-    "<blockquote>"
-    "☕ <b>Розклад тобі допомагає?</b>\n"
-    f'💛 <b><u><a href="{DONATE_URL}">ДОНАТ НА КАВУ АДМІНУ</a></u></b> 👈'
-    "</blockquote>"
+    "☕ <b>Розклад тобі допомагає?</b>\n\n"
+    "Бот працює щодня, а підтримує його адмін у вільний час.\n"
+    "Якщо розклад стає в пригоді — пригости адміна кавою 💛"
 )
+DONATE_BUTTON = {
+    "inline_keyboard": [[{"text": "☕ Пригостити адміна кавою", "url": DONATE_URL}]]
+}
 
 
 def tg_visible_len(html_text: str) -> int:
@@ -673,28 +675,34 @@ def format_day(events: List[Event], day: dt.date) -> str:
     return "\n".join(lines)
 
 
-def format_week_message(events: List[Event], start_day: dt.date, end_day: dt.date) -> str:
-    header = (
-        f"🗓️ <b>Розклад на тиждень</b>\n"
-        f"<b>{fmt_date_short(start_day)} – {fmt_date_short(end_day)}</b>\n\n"
-    )
+def format_week_messages(events: List[Event], start_day: dt.date, end_day: dt.date) -> List[str]:
+    """Тижневий розклад як список повідомлень. Якщо все не влазить у ліміт
+    Telegram (4096), ділимо по днях — день ніколи не розривається посередині."""
+    title = f"🗓️ <b>Розклад на тиждень</b>\n<b>{fmt_date_short(start_day)} – {fmt_date_short(end_day)}</b>\n\n"
+    cont_title = f"🗓️ <b>Розклад на тиждень</b> (продовження)\n<b>{fmt_date_short(start_day)} – {fmt_date_short(end_day)}</b>\n\n"
+    footer = f"\n{separator()}\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
+
     by_day: Dict[dt.date, List[Event]] = {
         start_day + dt.timedelta(days=i): []
         for i in range((end_day - start_day).days + 1)
     }
     for ev in events:
         by_day[ev.start.astimezone(KYIV_TZ).date()].append(ev)
-    blocks = []
-    for d in by_day.keys():
-        blocks.append(separator())
-        blocks.append(format_day(by_day[d], d))
-    blocks.append(separator())
-    msg = header + "\n".join(blocks) + f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
-    # Рядок про банку — лише якщо пост не впирається в ліміт Telegram
-    donate = f"\n\n{DONATE_LINE}"
-    if tg_visible_len(msg + donate) <= TG_MAX_LEN:
-        msg += donate
-    return msg
+    day_blocks = [f"{separator()}\n{format_day(by_day[d], d)}" for d in by_day]
+
+    messages: List[str] = []
+    cur = title
+    has_day = False
+    for block in day_blocks:
+        candidate = cur + ("\n" if has_day else "") + block
+        if has_day and tg_visible_len(candidate + footer) > TG_MAX_LEN:
+            messages.append(cur + f"\n{separator()}")
+            cur = cont_title + block
+        else:
+            cur = candidate
+        has_day = True
+    messages.append(cur + footer)
+    return messages
 
 
 def tg_send_message(
@@ -702,6 +710,7 @@ def tg_send_message(
     chat_id: str,
     text: str,
     message_thread_id: Optional[int] = None,
+    reply_markup: Optional[Dict] = None,
 ) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
@@ -712,6 +721,8 @@ def tg_send_message(
     }
     if message_thread_id is not None:
         payload["message_thread_id"] = message_thread_id
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
     data = r.json()
@@ -786,13 +797,23 @@ def main():
             print("Already posted weekly schedule for this week-range. Exiting.")
             return
         week_events = events_in_range(all_events, next_monday, next_sunday)
-        msg = format_week_message(week_events, next_monday, next_sunday)
+        messages = format_week_messages(week_events, next_monday, next_sunday)
         if schedule_thread_id is None:
             print("WARNING: TG_SCHEDULE_THREAD_ID not set. Weekly post will go to general chat.")
-        tg_send_message(token, chat_id, msg, message_thread_id=schedule_thread_id)
+        for msg in messages:
+            tg_send_message(token, chat_id, msg, message_thread_id=schedule_thread_id)
+        # Тиждень уже відправлено — фіксуємо одразу, щоб при збої банки
+        # наступний запуск не задублював розклад.
         mark_posted(state, "last_week", stamp)
         save_state(state)
-        print("Posted weekly schedule (next week).")
+        # Банка — окремим повідомленням з кнопкою, тож доходить завжди.
+        try:
+            tg_send_message(token, chat_id, DONATE_LINE,
+                            message_thread_id=schedule_thread_id,
+                            reply_markup=DONATE_BUTTON)
+        except Exception as e:
+            print(f"WARNING: donate message failed: {e}")
+        print(f"Posted weekly schedule (next week) in {len(messages)} message(s) + donate.")
 
 
 if __name__ == "__main__":
