@@ -636,13 +636,20 @@ TYPE_ICONS = {
 
 # Короткі підписи посилань для рядка «📘 Moodle · 🔗 Zoom»
 LINK_SHORT = {"zoom": "▶️", "meet": "▶️", "teams": "▶️", "moodle": "📘", "other": "🔗"}
-LINK_TEXT = {"zoom": "ZOOM", "meet": "MEET", "teams": "TEAMS", "moodle": "MOODLE", "other": "ПОСИЛАННЯ"}
+LINK_TEXT = {
+    "zoom": "Підключитися до Zoom",
+    "meet": "Підключитися до Meet",
+    "teams": "Підключитися до Teams",
+    "moodle": "Відкрити курс у Moodle",
+    "other": "Відкрити посилання",
+}
 
 NO_PLACE = "📍 (місце не вказано)"
 
 
 def link_html(kind: str, url: str) -> str:
-    return f'{LINK_SHORT[kind]} <b><a href="{escape_html_attr(url)}">{LINK_TEXT[kind]}</a></b>'
+    # Іконка теж усередині посилання, а текст довгий — більша зона натискання
+    return f'<a href="{escape_html_attr(url)}"><b>{LINK_SHORT[kind]} {LINK_TEXT[kind]} ›</b></a>'
 
 
 def short_place(location: str, description: str, meeting_kind: Optional[str]) -> str:
