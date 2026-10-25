@@ -58,14 +58,27 @@ def pair_no(t: dt.datetime) -> Optional[int]:
 MOODLE_LINKS = {
     # Посилання на Moodle з опису події має пріоритет над цим словником.
     "Туристичне країнознавство": "https://distance.kuk.edu.ua/course/view.php?id=8560",
+    "Анімаційний сервіс та організація дозвілля": "https://distance.kuk.edu.ua/course/view.php?id=8708",
     "Готельна справа": "https://distance.kuk.edu.ua/course/view.php?id=8064",
+    "Готельне обслуговування: організація і технології": "https://distance.kuk.edu.ua/course/view.php?id=7724",
     "Історія України": "https://distance.kuk.edu.ua/mod/attendance/view.php?id=175144",
+    "Енологія і Еногастрономія": "https://distance.kuk.edu.ua/course/view.php?id=8576",
     "Ділова українська мова": "https://distance.kuk.edu.ua/mod/quiz/view.php?id=125059",
     "Культурні та креативні індустрії": "https://distance.kuk.edu.ua/course/view.php?id=2067",
     "Барна справа": "https://distance.kuk.edu.ua/course/view.php?id=5472",
-    "Ресторанна справа": "https://distance.kuk.edu.ua/course/view.php?id=8561",
+    # Було двічі — Python бере останнє значення, тобто id=5510. Старе:
+    # "Ресторанна справа": "https://distance.kuk.edu.ua/course/view.php?id=8561",
+    "Ресторанна справа": "https://distance.kuk.edu.ua/course/view.php?id=5510",
     "Емоційний інтелект": "https://distance.kuk.edu.ua/mod/attendance/view.php?id=166795",
     "Товарознавство": "https://distance.kuk.edu.ua/mod/attendance/view.php?id=137551",
+    "Іноземна мова": "https://distance.kuk.edu.ua/course/view.php?id=8754",
+    "Корпоративні комунікації": "https://distance.kuk.edu.ua/course/view.php?id=8709",
+    "Кулінарологія": "https://distance.kuk.edu.ua/course/view.php?id=1936",
+    "Менеджмент": "https://distance.kuk.edu.ua/course/view.php?id=3678",
+    "Ресторанне обслуговування: організація і технології": "https://distance.kuk.edu.ua/course/view.php?id=5780",
+    "Страхування": "https://distance.kuk.edu.ua/course/view.php?id=7725",
+    "Філософія": "https://distance.kuk.edu.ua/course/view.php?id=592",
+    "Штучний інтелект та креатив": "https://distance.kuk.edu.ua/course/view.php?id=5788",
 }
 
 
