@@ -612,6 +612,11 @@ def short_place(location: str, description: str, meeting_kind: Optional[str]) ->
     return place
 
 
+def nb(html_text: str) -> str:
+    """Пробіли поза HTML-тегами → нерозривні: пункт переноситься цілим."""
+    return re.sub(r"(<[^>]*>)|( )", lambda m: m.group(1) or " ", html_text)
+
+
 def format_event(ev: Event) -> List[str]:
     """Компактний блок однієї пари (4 рядки)."""
     discipline, etype = split_summary(ev.summary)
@@ -633,45 +638,46 @@ def format_event(ev: Event) -> List[str]:
     pno = pair_no(ev.start)
     time_txt = f"{hhmm(ev.start)}–{hhmm(ev.end)}"
 
-    # 1) Час (+ тип)
+    # 1) Час
     if highlighted:
         lines.append(separator())
         lines.append(f"{'🛑' if is_rkr else '📝'} <b>{etype.upper()}!</b>")
-        if is_rkr and pno:
-            lines.append(f"🕒 <b>{pno} пара · {time_txt}</b>")
-        else:
-            lines.append(f"🕒 <b>{time_txt}</b>")
+    if pno and not is_exam:
+        lines.append(nb(f"🕒 <b>{pno} пара · {time_txt}</b>"))
     else:
-        head = f"🕒 <b>{pno} пара · {time_txt}</b>" if pno else f"🕒 <b>{time_txt}</b>"
-        if etype:
-            head += f" · {TYPE_ICONS.get(etype, '🎓')} {etype}"
-        lines.append(head)
+        lines.append(nb(f"🕒 <b>{time_txt}</b>"))
 
     # 2) Дисципліна
     lines.append(f"📚 <b>{escape_html(discipline)}</b>")
 
-    # 3) Викладач · місце
+    # 3) Тип · місце
     place = short_place(ev.location, ev.description, meeting[0] if meeting else None)
-    who_where = []
-    if teacher:
-        who_where.append(f"👩‍🏫 {escape_html(teacher)}")
+    kind_where = []
+    if etype and not highlighted:
+        kind_where.append(nb(f"{TYPE_ICONS.get(etype, '🎓')} {etype}"))
     if not (place == NO_PLACE and (moodle_url or meeting)):
-        who_where.append(escape_html(place))
-    if who_where:
-        lines.append(" · ".join(who_where))
+        kind_where.extend(nb(escape_html(p.strip())) for p in place.split("•"))
+    if kind_where:
+        lines.append(" · ".join(kind_where))
 
-    # 4) Посилання і код в одному рядку
+    # 4) Викладач
+    if teacher:
+        lines.append(nb(f"👩‍🏫 {escape_html(teacher)}"))
+
+    # 5) Посилання
     tools = []
     if moodle_url:
-        tools.append(link_html("moodle", moodle_url))
+        tools.append(nb(link_html("moodle", moodle_url)))
     if meeting:
-        tools.append(link_html(meeting[0], meeting[1]))
+        tools.append(nb(link_html(meeting[0], meeting[1])))
     for u in other_links:
-        tools.append(link_html("other", u))
-    if passcode:
-        tools.append(f"🔑 <code>{escape_html(passcode)}</code>")
+        tools.append(nb(link_html("other", u)))
     if tools:
         lines.append(" · ".join(tools))
+
+    # 6) Код — окремим рядком, щоб не відривався від 🔑
+    if passcode:
+        lines.append(f"🔑 <code>{escape_html(passcode)}</code>")
 
     if highlighted:
         lines.append(separator())
