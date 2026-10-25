@@ -593,14 +593,14 @@ TYPE_ICONS = {
 }
 
 # Короткі підписи посилань для рядка «📘 Moodle · 🔗 Zoom»
-LINK_SHORT = {"zoom": "🔗", "meet": "🔗", "teams": "🔗", "moodle": "📘", "other": "🔗"}
-LINK_TEXT = {"zoom": "Zoom", "meet": "Meet", "teams": "Teams", "moodle": "Moodle", "other": "Посилання"}
+LINK_SHORT = {"zoom": "▶️", "meet": "▶️", "teams": "▶️", "moodle": "📘", "other": "🔗"}
+LINK_TEXT = {"zoom": "ZOOM", "meet": "MEET", "teams": "TEAMS", "moodle": "MOODLE", "other": "ПОСИЛАННЯ"}
 
 NO_PLACE = "📍 (місце не вказано)"
 
 
 def link_html(kind: str, url: str) -> str:
-    return f'{LINK_SHORT[kind]} <a href="{escape_html_attr(url)}">{LINK_TEXT[kind]}</a>'
+    return f'{LINK_SHORT[kind]} <b><a href="{escape_html_attr(url)}">{LINK_TEXT[kind]}</a></b>'
 
 
 def short_place(location: str, description: str, meeting_kind: Optional[str]) -> str:
@@ -670,20 +670,20 @@ def format_event(ev: Event, with_links: bool = True) -> List[str]:
     if teacher:
         lines.append(nb(f"👩‍🏫 {escape_html(teacher)}"))
 
-    # 5) Посилання (у денних постах їх замінюють кнопки під повідомленням)
+    # 5) Посилання — жирним окремим рядком під парою
     tools = []
     if not with_links:
         moodle_url_txt, meeting_txt, other_txt = None, None, []
     else:
         moodle_url_txt, meeting_txt, other_txt = moodle_url, meeting, other_links
-    if moodle_url_txt:
-        tools.append(nb(link_html("moodle", moodle_url_txt)))
     if meeting_txt:
         tools.append(nb(link_html(meeting_txt[0], meeting_txt[1])))
+    if moodle_url_txt:
+        tools.append(nb(link_html("moodle", moodle_url_txt)))
     for u in other_txt:
         tools.append(nb(link_html("other", u)))
     if tools:
-        lines.append(" · ".join(tools))
+        lines.append("   ·   ".join(tools))
 
     # 6) Код — окремим рядком, щоб не відривався від 🔑
     if passcode:
@@ -711,47 +711,6 @@ def format_day(events: List[Event], day: dt.date, with_links: bool = True) -> st
     if not events:
         return out + "— (пар немає)"
     return out + format_events(events, with_links)
-
-
-def pair_label(evs: List[Event]) -> str:
-    """«1 пара», «1–2 пара», «1, 3 пара»; без номера — час початку."""
-    nums = [pair_no(e.start) for e in evs]
-    if all(nums):
-        nums = sorted(set(nums))
-        if len(nums) > 1 and nums == list(range(nums[0], nums[-1] + 1)):
-            return f"{nums[0]}–{nums[-1]} пара"
-        return ", ".join(map(str, nums)) + " пара"
-    return ", ".join(hhmm(e.start) for e in evs)
-
-
-def day_buttons(events: List[Event]) -> Optional[Dict]:
-    """Кнопки під денним постом: рядок на пару — [🔗 Zoom · 1 пара] [📘 Moodle · 1 пара].
-    Пари з однаковими посиланнями зливаються в один рядок («1–2 пара»)."""
-    groups: Dict[tuple, List[Event]] = {}
-    order: List[tuple] = []
-    for ev in sort_events(events):
-        meeting, moodle_url, others = event_links(ev)
-        key = (meeting, moodle_url, tuple(others))
-        if not (meeting or moodle_url or others):
-            continue
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append(ev)
-
-    rows = []
-    for key in order:
-        meeting, moodle_url, others = key
-        label = pair_label(groups[key])
-        row = []
-        if meeting:
-            row.append({"text": f"🔗 {MEETING_NAMES[meeting[0]]} · {label}", "url": meeting[1]})
-        if moodle_url:
-            row.append({"text": f"📘 Moodle · {label}", "url": moodle_url})
-        for u in others:
-            row.append({"text": f"🔗 Посилання · {label}", "url": u})
-        rows.append(row[:3])
-    return {"inline_keyboard": rows} if rows else None
 
 
 def plural_pairs(n: int) -> str:
@@ -872,10 +831,9 @@ def main():
         weather = format_weather_block(target, "сьогодні")
         msg = "<b>Доброго ранку шановні студенти!</b> ☀️\n\n" + weather
         msg += f"🗓️ <b>Розклад на сьогодні ({fmt_date_short(target)})</b>\n\n"
-        msg += format_day(day_events, target, with_links=False)
+        msg += format_day(day_events, target)
         msg += f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
-        tg_send_message(token, chat_id, msg, message_thread_id=None,
-                        reply_markup=day_buttons(day_events))
+        tg_send_message(token, chat_id, msg, message_thread_id=None)
         mark_posted(state, "last_today", stamp)
         save_state(state)
         print("Posted today schedule.")
@@ -893,10 +851,9 @@ def main():
         weather = format_weather_block(target, "завтра")
         msg = "<b>Добрий вечір шановні студенти!</b> 🌙\n\n" + weather
         msg += f"🗓️ <b>Розклад на завтра ({fmt_date_short(target)})</b>\n\n"
-        msg += format_day(day_events, target, with_links=False)
+        msg += format_day(day_events, target)
         msg += f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
-        tg_send_message(token, chat_id, msg, message_thread_id=None,
-                        reply_markup=day_buttons(day_events))
+        tg_send_message(token, chat_id, msg, message_thread_id=None)
         mark_posted(state, "last_tomorrow", stamp)
         save_state(state)
         print("Posted tomorrow schedule.")
