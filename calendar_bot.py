@@ -363,15 +363,6 @@ def split_summary(summary: str) -> Tuple[str, Optional[str]]:
 
 MEETING_KINDS = ("zoom", "meet", "teams")
 MEETING_NAMES = {"zoom": "Zoom", "meet": "Google Meet", "teams": "Teams"}
-LINK_LABELS = {
-    "zoom": "🔗 <a href=\"{u}\">Відкрити Zoom</a>",
-    "meet": "🔗 <a href=\"{u}\">Відкрити Google Meet</a>",
-    "teams": "🔗 <a href=\"{u}\">Відкрити Teams</a>",
-    "moodle": "📘 <a href=\"{u}\">Відкрити Moodle</a>",
-    "other": "🔗 <a href=\"{u}\">Посилання</a>",
-}
-
-
 def _unwrap_google_redirect(url: str) -> str:
     """Google Calendar іноді обгортає посилання в google.com/url?q=..."""
     try:
@@ -591,96 +582,162 @@ def escape_html_attr(s: str) -> str:
     return escape_html(s).replace('"', "&quot;")
 
 
-def link_line(kind: str, url: str) -> str:
-    return LINK_LABELS[kind].format(u=escape_html_attr(url))
+# Іконки типів занять
+TYPE_ICONS = {
+    "Лекція": "📖",
+    "Гостьова Лекція": "🎤",
+    "Практичне": "✍️",
+    "Лабораторна": "🧪",
+    "Семінар": "🗣️",
+    "Консультація": "💬",
+}
+
+# Короткі підписи посилань для рядка «📘 Moodle · 🔗 Zoom»
+LINK_SHORT = {"zoom": "🔗", "meet": "🔗", "teams": "🔗", "moodle": "📘", "other": "🔗"}
+LINK_TEXT = {"zoom": "Zoom", "meet": "Meet", "teams": "Teams", "moodle": "Moodle", "other": "Посилання"}
+
+NO_PLACE = "📍 (місце не вказано)"
+
+
+def link_html(kind: str, url: str) -> str:
+    return f'{LINK_SHORT[kind]} <a href="{escape_html_attr(url)}">{LINK_TEXT[kind]}</a>'
+
+
+def short_place(location: str, description: str, meeting_kind: Optional[str]) -> str:
+    """Місце для компактного блоку. Якщо є посилання на зустріч, назву сервісу
+    не дублюємо (вона й так на посиланні): просто «🌐 Online»."""
+    place = classify_place(location, description, meeting_kind)
+    if meeting_kind:
+        place = re.sub(r"^🌐 Online \([^)]*\)", "🌐 Online", place)
+    return place
+
+
+def format_event(ev: Event) -> List[str]:
+    """Компактний блок однієї пари (4 рядки)."""
+    discipline, etype = split_summary(ev.summary)
+    text_blob = ev.description + "\n" + ev.location
+    teacher = extract_teacher(ev.description)
+    passcode = extract_passcode(text_blob + "\n" + ev.summary)
+    links = extract_links(text_blob)
+
+    meeting = next(((k, u) for k, u in links if k in MEETING_KINDS), None)
+    moodle_url = (next((u for k, u in links if k == "moodle"), None)
+                  or MOODLE_LINKS_NORM.get(normalize_discipline(discipline)))
+    other_links = [u for k, u in links if k == "other"][:2]
+
+    is_exam = etype in EXAM_TYPES
+    is_rkr = etype == RKR_TYPE
+    highlighted = is_exam or is_rkr
+
+    lines: List[str] = []
+    pno = pair_no(ev.start)
+    time_txt = f"{hhmm(ev.start)}–{hhmm(ev.end)}"
+
+    # 1) Час (+ тип)
+    if highlighted:
+        lines.append(separator())
+        lines.append(f"{'🛑' if is_rkr else '📝'} <b>{etype.upper()}!</b>")
+        if is_rkr and pno:
+            lines.append(f"🕒 <b>{pno} пара · {time_txt}</b>")
+        else:
+            lines.append(f"🕒 <b>{time_txt}</b>")
+    else:
+        head = f"🕒 <b>{pno} пара · {time_txt}</b>" if pno else f"🕒 <b>{time_txt}</b>"
+        if etype:
+            head += f" · {TYPE_ICONS.get(etype, '🎓')} {etype}"
+        lines.append(head)
+
+    # 2) Дисципліна
+    lines.append(f"📚 <b>{escape_html(discipline)}</b>")
+
+    # 3) Викладач · місце
+    place = short_place(ev.location, ev.description, meeting[0] if meeting else None)
+    who_where = []
+    if teacher:
+        who_where.append(f"👩‍🏫 {escape_html(teacher)}")
+    if not (place == NO_PLACE and (moodle_url or meeting)):
+        who_where.append(escape_html(place))
+    if who_where:
+        lines.append(" · ".join(who_where))
+
+    # 4) Посилання і код в одному рядку
+    tools = []
+    if moodle_url:
+        tools.append(link_html("moodle", moodle_url))
+    if meeting:
+        tools.append(link_html(meeting[0], meeting[1]))
+    for u in other_links:
+        tools.append(link_html("other", u))
+    if passcode:
+        tools.append(f"🔑 <code>{escape_html(passcode)}</code>")
+    if tools:
+        lines.append(" · ".join(tools))
+
+    if highlighted:
+        lines.append(separator())
+    return lines
+
+
+def sort_events(events: List[Event]) -> List[Event]:
+    """Заліки/іспити — першими; решта (і РКР) — за часом."""
+    top = [ev for ev in events if split_summary(ev.summary)[1] in EXAM_TYPES]
+    rest = [ev for ev in events if split_summary(ev.summary)[1] not in EXAM_TYPES]
+    return top + rest
+
+
+def format_events(events: List[Event]) -> str:
+    return "\n\n".join("\n".join(format_event(ev)) for ev in sort_events(events))
 
 
 def format_day(events: List[Event], day: dt.date) -> str:
-    lines = []
-    lines.append(day_header(day))
-    lines.append("")
-
+    """День для ранкового/вечірнього посту — повністю розгорнутий."""
+    out = day_header(day) + "\n\n"
     if not events:
-        lines.append("— (пар немає)")
-        return "\n".join(lines)
+        return out + "— (пар немає)"
+    return out + format_events(events)
 
-    # Заліки/іспити — першими; РКР лишається на своєму місці за часом (у рамці)
-    top = [ev for ev in events if split_summary(ev.summary)[1] in EXAM_TYPES]
-    rest = [ev for ev in events if split_summary(ev.summary)[1] not in EXAM_TYPES]
-    sorted_events = top + rest
 
-    for ev in sorted_events:
-        discipline, etype = split_summary(ev.summary)
-        text_blob = ev.description + "\n" + ev.location
-        teacher = extract_teacher(ev.description)
-        passcode = extract_passcode(text_blob + "\n" + ev.summary)
-        links = extract_links(text_blob)
+def plural_pairs(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} пара"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} пари"
+    return f"{n} пар"
 
-        meeting = next(((k, u) for k, u in links if k in MEETING_KINDS), None)
-        moodle_url = (next((u for k, u in links if k == "moodle"), None)
-                      or MOODLE_LINKS_NORM.get(normalize_discipline(discipline)))
-        other_links = [u for k, u in links if k == "other"][:2]
 
-        is_exam = etype in EXAM_TYPES
-        is_rkr = etype == RKR_TYPE
-        highlighted = is_exam or is_rkr
+def day_summary(events: List[Event]) -> str:
+    """«3 пари · 09:00–13:50 · 🛑 РКР» — підсумок дня в тижневому пості."""
+    if not events:
+        return "вільний день 🎉"
+    evs = sorted(events, key=lambda e: e.start)
+    parts = [plural_pairs(len(evs)), f"{hhmm(evs[0].start)}–{hhmm(max(e.end for e in evs))}"]
+    types = {split_summary(e.summary)[1] for e in evs}
+    if RKR_TYPE in types:
+        parts.append("🛑 РКР")
+    for t in ("Залік", "Іспит", "Екзамен"):
+        if t in types:
+            parts.append(f"📝 {t.lower()}")
+    return " · ".join(parts)
 
-        if highlighted:
-            lines.append(separator())
-            icon = "🛑" if is_rkr else "📝"
-            lines.append(f"{icon} <b>{etype.upper()}!</b>")
-            if is_rkr:
-                pno = pair_no(ev.start)
-                pfx = f"{pno} пара " if pno else ""
-                lines.append(f"🕒 <b>{pfx}{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
-            else:
-                lines.append(f"🕒 <b>{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
-        else:
-            pno = pair_no(ev.start)
-            pfx = f"{pno} пара " if pno else ""
-            lines.append(f"🕒 <b>{pfx}{hhmm(ev.start)}–{hhmm(ev.end)}</b>")
 
-        lines.append(f"📚 <b>{escape_html(discipline)}</b>")
-
-        if moodle_url:
-            lines.append(link_line("moodle", moodle_url))
-
-        if etype and not highlighted:
-            lines.append(f"🎓 {etype}")
-
-        if teacher:
-            lines.append(f"👩\u200d🏫 {escape_html(teacher)}")
-
-        place = classify_place(ev.location, ev.description,
-                               meeting[0] if meeting else None)
-        # Якщо є лише Moodle і більше нічого — «місце не вказано» не пишемо
-        if not (moodle_url and place == "📍 (місце не вказано)"):
-            lines.append(escape_html(place))
-        if meeting:
-            lines.append(link_line(meeting[0], meeting[1]))
-        for u in other_links:
-            lines.append(link_line("other", u))
-        if passcode:
-            lines.append("🔑 Код доступу:")
-            lines.append(f"📎 <code>{escape_html(passcode)}</code>")
-
-        if highlighted:
-            lines.append(separator())
-
-        lines.append("")
-
-    while lines and lines[-1] == "":
-        lines.pop()
-
-    return "\n".join(lines)
+def format_week_day(events: List[Event], day: dt.date) -> str:
+    """День у тижневому пості: заголовок з підсумком + деталі в розгортній цитаті."""
+    head = f"📅 <b>{UA_DOW[day.weekday()]} · {fmt_date_short(day)}</b> — {day_summary(events)}"
+    if not events:
+        return head
+    # У цитаті менше місця — короткий роздільник, щоб не переносився на телефоні
+    body = format_events(events).replace(separator(), "━" * 12)
+    return f"{head}\n<blockquote expandable>{body}</blockquote>"
 
 
 def format_week_messages(events: List[Event], start_day: dt.date, end_day: dt.date) -> List[str]:
-    """Тижневий розклад як список повідомлень. Якщо все не влазить у ліміт
-    Telegram (4096), ділимо по днях — день ніколи не розривається посередині."""
-    title = f"🗓️ <b>Розклад на тиждень</b>\n<b>{fmt_date_short(start_day)} – {fmt_date_short(end_day)}</b>\n\n"
-    cont_title = f"🗓️ <b>Розклад на тиждень</b> (продовження)\n<b>{fmt_date_short(start_day)} – {fmt_date_short(end_day)}</b>\n\n"
-    footer = f"\n{separator()}\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
+    """Тижневий розклад як список повідомлень. Кожен день — заголовок з підсумком
+    і розгортна цитата з деталями. Якщо все не влазить у ліміт Telegram (4096),
+    ділимо по днях — день ніколи не розривається посередині."""
+    rng = f"{fmt_date_short(start_day)} – {fmt_date_short(end_day)}"
+    title = f"🗓️ <b>Розклад на тиждень · {rng}</b>\n<i>Торкнись блоку під днем, щоб розгорнути пари 👇</i>\n\n"
+    cont_title = f"🗓️ <b>Розклад на тиждень · {rng}</b> (продовження)\n\n"
+    footer = f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
 
     by_day: Dict[dt.date, List[Event]] = {
         start_day + dt.timedelta(days=i): []
@@ -688,15 +745,15 @@ def format_week_messages(events: List[Event], start_day: dt.date, end_day: dt.da
     }
     for ev in events:
         by_day[ev.start.astimezone(KYIV_TZ).date()].append(ev)
-    day_blocks = [f"{separator()}\n{format_day(by_day[d], d)}" for d in by_day]
+    day_blocks = [format_week_day(by_day[d], d) for d in by_day]
 
     messages: List[str] = []
     cur = title
     has_day = False
     for block in day_blocks:
-        candidate = cur + ("\n" if has_day else "") + block
+        candidate = cur + ("\n\n" if has_day else "") + block
         if has_day and tg_visible_len(candidate + footer) > TG_MAX_LEN:
-            messages.append(cur + f"\n{separator()}")
+            messages.append(cur)
             cur = cont_title + block
         else:
             cur = candidate
