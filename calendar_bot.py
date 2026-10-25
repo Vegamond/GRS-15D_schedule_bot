@@ -591,10 +591,12 @@ def format_weather_block(day: dt.date, label: str) -> str:
     if not w:
         return ""
     icon, desc = weathercode_ua(w["code"])
-    line = (f"{icon} <b>{label.capitalize()} в Дніпрі:</b> {desc} · "
-            f"зранку {fmt_temp(w['tmorning'])}, вдень до {fmt_temp(w['tmax'])}")
-    lines = [line] + weather_hints(w)
-    return "\n".join(lines) + "\n\n"
+    lines = [
+        f"{icon} <b>{label.capitalize()} в Дніпрі</b> — {desc}",
+        f"🌅 Зранку <b>{fmt_temp(w['tmorning'])}</b> · вдень до <b>{fmt_temp(w['tmax'])}</b>",
+    ] + weather_hints(w)
+    # Цитата — кольорова смужка й підсвічений фон, погода відділяється від розкладу
+    return "<blockquote>" + "\n".join(lines) + "</blockquote>\n\n"
 
 
 def hhmm(t: dt.datetime) -> str:
@@ -717,24 +719,24 @@ def format_event(ev: Event, with_links: bool = True) -> List[str]:
     if teacher:
         lines.append(nb(f"👩‍🏫 {escape_html(teacher)}"))
 
-    # 5) Посилання — жирним окремим рядком під парою
+    # 5) Посилання — жирні, кожне на своєму рядку
     tools = []
     if not with_links:
         moodle_url_txt, meeting_txt, other_txt = None, None, []
     else:
         moodle_url_txt, meeting_txt, other_txt = moodle_url, meeting, other_links
-    if meeting_txt:
-        tools.append(nb(link_html(meeting_txt[0], meeting_txt[1])))
     if moodle_url_txt:
         tools.append(nb(link_html("moodle", moodle_url_txt)))
+    if meeting_txt:
+        tools.append(nb(link_html(meeting_txt[0], meeting_txt[1])))
     for u in other_txt:
         tools.append(nb(link_html("other", u)))
-    if tools:
-        lines.append("   ·   ".join(tools))
+    # кожне посилання окремим рядком — щоб на телефоні не влучити не туди
+    lines.extend(tools)
 
-    # 6) Код — окремим рядком, щоб не відривався від 🔑
+    # 6) Код — одразу під своїм Zoom, з підписом
     if passcode:
-        lines.append(f"🔑 <code>{escape_html(passcode)}</code>")
+        lines.append(f"🔑 Код: <code>{escape_html(passcode)}</code>")
 
     if highlighted:
         lines.append(separator())
@@ -850,15 +852,45 @@ def tg_send_message(
         raise RuntimeError(f"Telegram error: {data}")
 
 
+TEST_BANNER = "🧪 <b>ТЕСТ</b> — це бачиш тільки ти, у групу не пішло\n\n"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=["today", "tomorrow", "week"], help="Posting mode")
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Надіслати пост в особисті (TEST_CHAT_ID), а не в групу. "
+             "Ігнорує дні тижня, не перевіряє і не змінює state.json."
+    )
     args = parser.parse_args()
+    test = args.test
 
     token = env_required("TG_BOT_TOKEN")
-    chat_id = env_required("TG_CHAT_ID")
     ics_url = env_required("GCAL_ICS_URL")
-    schedule_thread_id = env_optional_int("TG_SCHEDULE_THREAD_ID")
+    if test:
+        chat_id = env_required("TEST_CHAT_ID")
+        schedule_thread_id = None
+        print("TEST MODE: posting to TEST_CHAT_ID, state.json is not touched.")
+    else:
+        chat_id = env_required("TG_CHAT_ID")
+        schedule_thread_id = env_optional_int("TG_SCHEDULE_THREAD_ID")
+
+    def send(text: str, thread: Optional[int] = None,
+             reply_markup: Optional[Dict] = None, banner: bool = True) -> None:
+        if test and banner:
+            text = TEST_BANNER + text
+        tg_send_message(token, chat_id, text, message_thread_id=thread,
+                        reply_markup=reply_markup)
+
+    def already_posted(key: str, stamp: str) -> bool:
+        return not test and not should_post(state, key, stamp)
+
+    def remember(key: str, stamp: str) -> None:
+        if not test:
+            mark_posted(state, key, stamp)
+            save_state(state)
 
     state = load_state()
     ics = fetch_ics(ics_url)
@@ -866,12 +898,12 @@ def main():
     today = now_kyiv().date()
 
     if args.mode == "today":
-        if is_saturday(today) or is_sunday(today):
+        if not test and (is_saturday(today) or is_sunday(today)):
             print("Skipping 'today': no today-posts on Saturday or Sunday.")
             return
         target = today
         stamp = f"today:{iso_date(target)}"
-        if not should_post(state, "last_today", stamp):
+        if already_posted("last_today", stamp):
             print("Already posted today schedule for this date. Exiting.")
             return
         day_events = events_in_range(all_events, target, target)
@@ -880,18 +912,17 @@ def main():
         msg += f"🗓️ <b>Розклад на сьогодні ({fmt_date_short(target)})</b>\n\n"
         msg += format_day(day_events, target)
         msg += f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
-        tg_send_message(token, chat_id, msg, message_thread_id=None)
-        mark_posted(state, "last_today", stamp)
-        save_state(state)
+        send(msg)
+        remember("last_today", stamp)
         print("Posted today schedule.")
 
     elif args.mode == "tomorrow":
-        if is_saturday(today):
+        if not test and is_saturday(today):
             print("Skipping 'tomorrow': no posts on Saturday.")
             return
         target = today + dt.timedelta(days=1)
         stamp = f"tomorrow:{iso_date(target)}"
-        if not should_post(state, "last_tomorrow", stamp):
+        if already_posted("last_tomorrow", stamp):
             print("Already posted tomorrow schedule for this date. Exiting.")
             return
         day_events = events_in_range(all_events, target, target)
@@ -900,37 +931,34 @@ def main():
         msg += f"🗓️ <b>Розклад на завтра ({fmt_date_short(target)})</b>\n\n"
         msg += format_day(day_events, target)
         msg += f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
-        tg_send_message(token, chat_id, msg, message_thread_id=None)
-        mark_posted(state, "last_tomorrow", stamp)
-        save_state(state)
+        send(msg)
+        remember("last_tomorrow", stamp)
         print("Posted tomorrow schedule.")
 
     elif args.mode == "week":
-        if not is_sunday(today):
+        if not test and not is_sunday(today):
             print("Skipping 'week': weekly post should run on Sunday only.")
             return
         this_monday = today - dt.timedelta(days=today.weekday())
         next_monday = this_monday + dt.timedelta(days=7)
         next_sunday = next_monday + dt.timedelta(days=6)
         stamp = f"week:{iso_date(next_monday)}:{iso_date(next_sunday)}"
-        if not should_post(state, "last_week", stamp):
+        if already_posted("last_week", stamp):
             print("Already posted weekly schedule for this week-range. Exiting.")
             return
         week_events = events_in_range(all_events, next_monday, next_sunday)
         messages = format_week_messages(week_events, next_monday, next_sunday)
-        if schedule_thread_id is None:
+        if not test and schedule_thread_id is None:
             print("WARNING: TG_SCHEDULE_THREAD_ID not set. Weekly post will go to general chat.")
-        for msg in messages:
-            tg_send_message(token, chat_id, msg, message_thread_id=schedule_thread_id)
+        for i, msg in enumerate(messages):
+            send(msg, thread=schedule_thread_id, banner=(i == 0))
         # Тиждень уже відправлено — фіксуємо одразу, щоб при збої банки
         # наступний запуск не задублював розклад.
-        mark_posted(state, "last_week", stamp)
-        save_state(state)
+        remember("last_week", stamp)
         # Банка — окремим повідомленням з кнопкою, тож доходить завжди.
         try:
-            tg_send_message(token, chat_id, DONATE_LINE,
-                            message_thread_id=schedule_thread_id,
-                            reply_markup=DONATE_BUTTON)
+            send(DONATE_LINE, thread=schedule_thread_id,
+                 reply_markup=DONATE_BUTTON, banner=False)
         except Exception as e:
             print(f"WARNING: donate message failed: {e}")
         print(f"Posted weekly schedule (next week) in {len(messages)} message(s) + donate.")
