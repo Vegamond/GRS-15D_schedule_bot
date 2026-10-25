@@ -664,7 +664,14 @@ def format_event(ev: Event, with_links: bool = True) -> List[str]:
     if not (place == NO_PLACE and (moodle_url or meeting)):
         kind_where.extend(nb(escape_html(p.strip())) for p in place.split("•"))
     if kind_where:
-        lines.append(" · ".join(kind_where))
+        joined = " · ".join(kind_where)
+        # На телефоні в рядок влазить ~26 символів. Якщо тип + місце довші —
+        # місце окремим рядком, щоб «·» не повисала в кінці рядка.
+        if len(kind_where) > 1 and tg_visible_len(joined) > 26 and etype and not highlighted:
+            lines.append(kind_where[0])
+            lines.append(" · ".join(kind_where[1:]))
+        else:
+            lines.append(joined)
 
     # 4) Викладач
     if teacher:
