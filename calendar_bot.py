@@ -3,6 +3,8 @@
 
 import os
 import re
+import time
+import subprocess
 import html
 import json
 import argparse
@@ -23,7 +25,6 @@ DONATE_URL = "https://send.monobank.ua/jar/2rWrXwkk7H"
 # Номер картки банки (monobank → банка → «Поповнити з картки іншого банку»).
 # Порожній рядок — кнопка копіювання не показується.
 DONATE_CARD = "4874 1000 3360 9226"
-
 DONATE_LINE = (
     "☕ <b>Розклад тобі допомагає?</b>\n\n"
     "Бот працює щодня, а підтримує його адмін у вільний час.\n"
@@ -75,31 +76,27 @@ def pair_no(t: dt.datetime) -> Optional[int]:
     return PAIR_BY_START.get(s)
 
 
-MOODLE_LINKS = {
-    # Посилання на Moodle з опису події має пріоритет над цим словником.
-    "Туристичне країнознавство": "https://distance.kuk.edu.ua/course/view.php?id=8560",
-    "Анімаційний сервіс та організація дозвілля": "https://distance.kuk.edu.ua/course/view.php?id=8708",
-    "Готельна справа": "https://distance.kuk.edu.ua/course/view.php?id=8064",
-    "Готельне обслуговування: організація і технології": "https://distance.kuk.edu.ua/course/view.php?id=7724",
-    "Історія України": "https://distance.kuk.edu.ua/mod/attendance/view.php?id=175144",
-    "Енологія і Еногастрономія": "https://distance.kuk.edu.ua/course/view.php?id=8576",
-    "Ділова українська мова": "https://distance.kuk.edu.ua/mod/quiz/view.php?id=125059",
-    "Культурні та креативні індустрії": "https://distance.kuk.edu.ua/course/view.php?id=2067",
-    "Барна справа": "https://distance.kuk.edu.ua/course/view.php?id=5472",
-    # Було двічі — Python бере останнє значення, тобто id=5510. Старе:
-    # "Ресторанна справа": "https://distance.kuk.edu.ua/course/view.php?id=8561",
-    "Ресторанна справа": "https://distance.kuk.edu.ua/course/view.php?id=5510",
-    "Емоційний інтелект": "https://distance.kuk.edu.ua/mod/attendance/view.php?id=166795",
-    "Товарознавство": "https://distance.kuk.edu.ua/mod/attendance/view.php?id=137551",
-    "Іноземна мова": "https://distance.kuk.edu.ua/course/view.php?id=8754",
-    "Корпоративні комунікації": "https://distance.kuk.edu.ua/course/view.php?id=8709",
-    "Кулінарологія": "https://distance.kuk.edu.ua/course/view.php?id=1936",
-    "Менеджмент": "https://distance.kuk.edu.ua/course/view.php?id=3678",
-    "Ресторанне обслуговування: організація і технології": "https://distance.kuk.edu.ua/course/view.php?id=5780",
-    "Страхування": "https://distance.kuk.edu.ua/course/view.php?id=7725",
-    "Філософія": "https://distance.kuk.edu.ua/course/view.php?id=592",
-    "Штучний інтелект та креатив": "https://distance.kuk.edu.ua/course/view.php?id=5788",
-}
+MOODLE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moodle.json")
+
+
+def load_moodle_links() -> Dict[str, str]:
+    """Посилання на курси Moodle для цієї групи — у moodle.json поруч з ботом:
+    {"Назва дисципліни": "https://distance.kuk.edu.ua/..."}.
+    Ключі, що починаються з «_», бот ігнорує (туди можна складати чернетки).
+    Посилання на Moodle з опису події має пріоритет над цим файлом."""
+    try:
+        with open(MOODLE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"WARNING: moodle.json is broken, Moodle links skipped: {e}")
+        return {}
+    return {k: v for k, v in data.items()
+            if isinstance(v, str) and v and not k.startswith("_")}
+
+
+MOODLE_LINKS = load_moodle_links()
 
 
 def normalize_discipline(name: str) -> str:
@@ -604,8 +601,9 @@ def fmt_temp(t: int) -> str:
     return f"+{t}°C" if t > 0 else f"{t}°C"
 
 
-def format_weather_block(day: dt.date, label: str) -> str:
-    w = get_weather_dnipro(day)
+def format_weather_block(day: dt.date, label: str, w: Optional[Dict] = None) -> str:
+    if w is None:
+        w = get_weather_dnipro(day)
     if not w:
         return ""
     icon, desc = weathercode_ua(w["code"])
@@ -858,14 +856,23 @@ def tg_send_message(
     text: str,
     message_thread_id: Optional[int] = None,
     reply_markup: Optional[Dict] = None,
+    preview_url: Optional[str] = None,
 ) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": True,
     }
+    if preview_url:
+        # Велика картинка НАД текстом — у тому ж повідомленні
+        payload["link_preview_options"] = {
+            "url": preview_url,
+            "prefer_large_media": True,
+            "show_above_text": True,
+        }
+    else:
+        payload["link_preview_options"] = {"is_disabled": True}
     if message_thread_id is not None:
         payload["message_thread_id"] = message_thread_id
     if reply_markup is not None:
@@ -875,6 +882,174 @@ def tg_send_message(
     data = r.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegram error: {data}")
+
+
+def tg_send_photo(token: str, chat_id: str, path: str,
+                  message_thread_id: Optional[int] = None) -> None:
+    data = {"chat_id": chat_id}
+    if message_thread_id is not None:
+        data["message_thread_id"] = message_thread_id
+    with open(path, "rb") as f:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendPhoto",
+                          data=data, files={"photo": f}, timeout=60)
+    r.raise_for_status()
+    if not r.json().get("ok"):
+        raise RuntimeError(f"Telegram error: {r.text}")
+
+
+# ───────────────────────── Картинки-банери ─────────────────────────
+
+CARDS_DIR = "cards"
+CARDS_KEEP_DAYS = 14
+UA_MONTHS_GEN = ["січня", "лютого", "березня", "квітня", "травня", "червня", "липня",
+                 "серпня", "вересня", "жовтня", "листопада", "грудня"]
+UA_DOW_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+
+
+def plain_place(ev: Event, meeting_kind: Optional[str]) -> str:
+    """Місце без емодзі для картинки: «Online · ауд. 207»."""
+    blob = f"{ev.location}\n{ev.description}".lower()
+    parts = []
+    if meeting_kind or "online" in blob or "онлайн" in blob or "zoom" in blob:
+        parts.append("Online")
+    aud = AUD_RE.search(blob)
+    if aud:
+        parts.append(fmt_aud(aud))
+    if not parts:
+        loc = URL_RE.sub("", ev.location).strip(" ,;\n")
+        if loc:
+            parts.append(loc)
+    return " · ".join(parts)
+
+
+def nearest_pair(t: dt.datetime) -> int:
+    """Номер пари для сітки: точний збіг або найближчий час початку."""
+    no = pair_no(t)
+    if no:
+        return no
+    mins = t.hour * 60 + t.minute
+    def dist(item):
+        h, m = map(int, item[0].split(":"))
+        return abs(h * 60 + m - mins)
+    return min(PAIR_BY_START.items(), key=dist)[1]
+
+
+def card_weather(w: Optional[Dict]) -> Optional[Dict]:
+    if not w:
+        return None
+    _, desc = weathercode_ua(w["code"])
+    sign = lambda t: f"+{t}" if t > 0 else str(t)
+    return {"code": w["code"], "tmorning": sign(w["tmorning"]), "tmax": sign(w["tmax"]), "desc": desc}
+
+
+def make_day_card(events: List[Event], day: dt.date, label: str,
+                  w: Optional[Dict], tag: str) -> Optional[str]:
+    if not events:
+        return None
+    try:
+        import cards
+        pairs = []
+        for ev in sort_events(events):
+            discipline, etype = split_summary(ev.summary)
+            meeting, _, _ = event_links(ev)
+            pairs.append({
+                "no": pair_no(ev.start), "start": hhmm(ev.start), "end": hhmm(ev.end),
+                "name": discipline, "teacher": extract_teacher(ev.description),
+                "type": etype, "place": plain_place(ev, meeting[0] if meeting else None),
+            })
+        os.makedirs(CARDS_DIR, exist_ok=True)
+        path = os.path.join(CARDS_DIR, f"day-{day.isoformat()}-{tag}.png")
+        cards.render_day(path, label, UA_DOW[day.weekday()],
+                         f"{day.day} {UA_MONTHS_GEN[day.month - 1]}", card_weather(w), pairs)
+        return path
+    except Exception as e:
+        print(f"WARNING: day card failed: {e}")
+        return None
+
+
+def make_week_card(events: List[Event], start: dt.date, end: dt.date, tag: str) -> Optional[str]:
+    if not events:
+        return None
+    try:
+        import cards
+        n_days = 5
+        for d in (5, 6):   # субота/неділя — лише якщо в них є пари
+            if any(ev.start.astimezone(KYIV_TZ).date() == start + dt.timedelta(days=d) for ev in events):
+                n_days = d + 1
+        days = [(UA_DOW_SHORT[(start + dt.timedelta(days=i)).weekday()],
+                 fmt_date_short(start + dt.timedelta(days=i)), False) for i in range(n_days)]
+        starts = sorted(PAIR_BY_START.items(), key=lambda x: x[1])
+        times = []
+        for t, no in starts:
+            h, m = map(int, t.split(":"))
+            e = dt.datetime(2000, 1, 1, h, m) + dt.timedelta(minutes=80)
+            times.append((no, t, e.strftime("%H:%M")))
+        grid = {}
+        for ev in sort_events(events):
+            c = (ev.start.astimezone(KYIV_TZ).date() - start).days
+            r = nearest_pair(ev.start) - 1
+            if 0 <= c < n_days and 0 <= r < len(times) and (c, r) not in grid:
+                discipline, etype = split_summary(ev.summary)
+                grid[(c, r)] = (discipline, etype)
+        os.makedirs(CARDS_DIR, exist_ok=True)
+        path = os.path.join(CARDS_DIR, f"week-{start.isoformat()}-{tag}.png")
+        cards.render_week(path, f"{fmt_date_short(start)} – {fmt_date_short(end)}", days, times, grid)
+        return path
+    except Exception as e:
+        print(f"WARNING: week card failed: {e}")
+        return None
+
+
+def _git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], capture_output=True, text=True, timeout=90)
+
+
+def cleanup_old_cards(today: dt.date) -> None:
+    """Видаляємо картинки, старші за CARDS_KEEP_DAYS, щоб репозиторій не ріс."""
+    if not os.path.isdir(CARDS_DIR):
+        return
+    border = today - dt.timedelta(days=CARDS_KEEP_DAYS)
+    for name in os.listdir(CARDS_DIR):
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", name)
+        if m and dt.date.fromisoformat(m.group(1)) < border:
+            os.remove(os.path.join(CARDS_DIR, name))
+
+
+def publish_card(path: str, today: dt.date) -> Optional[str]:
+    """Комітить картинку в репозиторій і повертає її пряме посилання,
+    якщо Telegram зможе її відкрити (публічний репозиторій). Інакше None."""
+    repo = os.getenv("GITHUB_REPOSITORY")
+    if not repo or os.getenv("GITHUB_ACTIONS") != "true":
+        return None
+    try:
+        cleanup_old_cards(today)
+        if not _git("config", "user.email").stdout.strip():
+            _git("config", "user.name", "github-actions")
+            _git("config", "user.email", "github-actions@github.com")
+        _git("add", "-A", CARDS_DIR)
+        _git("commit", "-m", f"Schedule card {os.path.basename(path)}")
+        branch = os.getenv("GITHUB_REF_NAME") or "main"
+        for _ in range(3):
+            _git("pull", "--rebase", "--autostash", "origin", branch)
+            if _git("push", "origin", f"HEAD:{branch}").returncode == 0:
+                break
+        else:
+            print("WARNING: could not push card")
+            return None
+        sha = _git("rev-parse", "HEAD").stdout.strip()
+        url = f"https://raw.githubusercontent.com/{repo}/{sha}/{path.replace(os.sep, '/')}"
+        for _ in range(5):
+            try:
+                if requests.head(url, timeout=10).status_code == 200:
+                    return url
+            except requests.RequestException:
+                pass
+            time.sleep(2)
+        print("INFO: card URL not public — sending the picture as a separate photo")
+        return None
+    except Exception as e:
+        print(f"WARNING: publish card failed: {e}")
+        return None
 
 
 TEST_BANNER = "🧪 <b>ТЕСТ</b> — це бачиш тільки ти, у групу не пішло\n\n"
@@ -888,6 +1063,12 @@ def main():
         action="store_true",
         help="Надіслати пост в особисті (TEST_CHAT_ID), а не в групу. "
              "Ігнорує дні тижня, не перевіряє і не змінює state.json."
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="week: опублікувати розклад ПОТОЧНОГО тижня в будь-який день "
+             "(напр. якщо недільний пост не вийшов)."
     )
     args = parser.parse_args()
     test = args.test
@@ -903,11 +1084,27 @@ def main():
         schedule_thread_id = env_optional_int("TG_SCHEDULE_THREAD_ID")
 
     def send(text: str, thread: Optional[int] = None,
-             reply_markup: Optional[Dict] = None, banner: bool = True) -> None:
+             reply_markup: Optional[Dict] = None, banner: bool = True,
+             preview_url: Optional[str] = None) -> None:
         if test and banner:
             text = TEST_BANNER + text
         tg_send_message(token, chat_id, text, message_thread_id=thread,
-                        reply_markup=reply_markup)
+                        reply_markup=reply_markup, preview_url=preview_url)
+
+    def send_with_card(text: str, card: Optional[str], thread: Optional[int] = None,
+                       banner: bool = True) -> None:
+        """Картинка над текстом в одному повідомленні; якщо посилання на неї
+        недоступне — окремим фото перед текстом. Збій картинки пост не ламає."""
+        url = publish_card(card, today) if card else None
+        if url:
+            send(text, thread, banner=banner, preview_url=url)
+            return
+        if card:
+            try:
+                tg_send_photo(token, chat_id, card, message_thread_id=thread)
+            except Exception as e:
+                print(f"WARNING: photo failed: {e}")
+        send(text, thread, banner=banner)
 
     def already_posted(key: str, stamp: str) -> bool:
         return not test and not should_post(state, key, stamp)
@@ -921,6 +1118,8 @@ def main():
     ics = fetch_ics(ics_url)
     all_events = parse_ics_events(ics)
     today = now_kyiv().date()
+    # унікальна назва картинки: Telegram кешує прев'ю за посиланням
+    card_tag = now_kyiv().strftime("%H%M%S") + ("-test" if test else "")
 
     if args.mode == "today":
         if not test and (is_saturday(today) or is_sunday(today)):
@@ -932,12 +1131,14 @@ def main():
             print("Already posted today schedule for this date. Exiting.")
             return
         day_events = events_in_range(all_events, target, target)
-        weather = format_weather_block(target, "сьогодні")
+        w = get_weather_dnipro(target)
+        weather = format_weather_block(target, "сьогодні", w)
         msg = "<b>Доброго ранку шановні студенти!</b> ☀️\n\n" + weather
         msg += f"🗓️ <b>Розклад на сьогодні ({fmt_date_short(target)})</b>\n\n"
         msg += format_day(day_events, target)
         msg += f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
-        send(msg)
+        card = make_day_card(day_events, target, "Розклад на сьогодні", w, card_tag)
+        send_with_card(msg, card)
         remember("last_today", stamp)
         print("Posted today schedule.")
 
@@ -951,21 +1152,27 @@ def main():
             print("Already posted tomorrow schedule for this date. Exiting.")
             return
         day_events = events_in_range(all_events, target, target)
-        weather = format_weather_block(target, "завтра")
+        w = get_weather_dnipro(target)
+        weather = format_weather_block(target, "завтра", w)
         msg = "<b>Добрий вечір шановні студенти!</b> 🌙\n\n" + weather
         msg += f"🗓️ <b>Розклад на завтра ({fmt_date_short(target)})</b>\n\n"
         msg += format_day(day_events, target)
         msg += f"\n\n⏱️ Оновлено: {now_kyiv().strftime('%H:%M')}"
-        send(msg)
+        card = make_day_card(day_events, target, "Розклад на завтра", w, card_tag)
+        send_with_card(msg, card)
         remember("last_tomorrow", stamp)
         print("Posted tomorrow schedule.")
 
     elif args.mode == "week":
-        if not test and not is_sunday(today):
+        if not test and not args.force and not is_sunday(today):
             print("Skipping 'week': weekly post should run on Sunday only.")
             return
         this_monday = today - dt.timedelta(days=today.weekday())
-        next_monday = this_monday + dt.timedelta(days=7)
+        # --force у будній день — поточний тиждень; у неділю й за розкладом — наступний
+        if args.force and not is_sunday(today):
+            next_monday = this_monday
+        else:
+            next_monday = this_monday + dt.timedelta(days=7)
         next_sunday = next_monday + dt.timedelta(days=6)
         stamp = f"week:{iso_date(next_monday)}:{iso_date(next_sunday)}"
         if already_posted("last_week", stamp):
@@ -975,8 +1182,12 @@ def main():
         messages = format_week_messages(week_events, next_monday, next_sunday)
         if not test and schedule_thread_id is None:
             print("WARNING: TG_SCHEDULE_THREAD_ID not set. Weekly post will go to general chat.")
+        card = make_week_card(week_events, next_monday, next_sunday, card_tag)
         for i, msg in enumerate(messages):
-            send(msg, thread=schedule_thread_id, banner=(i == 0))
+            if i == 0:
+                send_with_card(msg, card, thread=schedule_thread_id)
+            else:
+                send(msg, thread=schedule_thread_id, banner=False)
         # Тиждень уже відправлено — фіксуємо одразу, щоб при збої банки
         # наступний запуск не задублював розклад.
         remember("last_week", stamp)
