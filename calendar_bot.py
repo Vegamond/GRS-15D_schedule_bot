@@ -20,14 +20,32 @@ TG_MAX_LEN = 4096
 
 # Банка «На каву адміну ☕» — окреме повідомлення з кнопкою після тижневого посту
 DONATE_URL = "https://send.monobank.ua/jar/2rWrXwkk7H"
+# Номер картки банки (monobank → банка → «Поповнити з картки іншого банку»).
+# Порожній рядок — кнопка копіювання не показується.
+DONATE_CARD = ""
+
 DONATE_LINE = (
     "☕ <b>Розклад тобі допомагає?</b>\n\n"
     "Бот працює щодня, а підтримує його адмін у вільний час.\n"
     "Якщо розклад стає в пригоді — пригости адміна кавою 💛"
 )
-DONATE_BUTTON = {
-    "inline_keyboard": [[{"text": "☕ Пригостити адміна кавою", "url": DONATE_URL}]]
-}
+if DONATE_CARD:
+    DONATE_LINE += (
+        "\n\n💳 Немає монобанку? Скопіюй номер картки банки "
+        "і переказуй з будь-якого банку."
+    )
+
+
+def donate_button() -> Dict:
+    rows = [[{"text": "☕ Банка monobank", "url": DONATE_URL}]]
+    if DONATE_CARD:
+        # Кнопка копіює номер у буфер обміну одним дотиком
+        rows.append([{"text": "📋 Скопіювати номер картки",
+                      "copy_text": {"text": DONATE_CARD.replace(" ", "")}}])
+    return {"inline_keyboard": rows}
+
+
+DONATE_BUTTON = donate_button()
 
 
 def tg_visible_len(html_text: str) -> int:
