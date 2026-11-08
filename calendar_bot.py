@@ -22,7 +22,7 @@ TG_MAX_LEN = 4096
 DONATE_URL = "https://send.monobank.ua/jar/2rWrXwkk7H"
 # Номер картки банки (monobank → банка → «Поповнити з картки іншого банку»).
 # Порожній рядок — кнопка копіювання не показується.
-DONATE_CARD = ""
+DONATE_CARD = "4874 1000 3360 9226"
 
 DONATE_LINE = (
     "☕ <b>Розклад тобі допомагає?</b>\n\n"
